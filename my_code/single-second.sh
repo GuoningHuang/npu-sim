@@ -1,0 +1,15 @@
+python3 ../llm/test/tool_script/workload_autogen.py \
+  --B 1 \
+  --T 2 \
+  --HS 2048 \
+  --NH 16 \
+  --DH 128 \
+  --KVH 16 \
+  --L 24 \
+  --IS 5504 \
+  --pp 16 \
+  --dp 1 \
+  --tp 2_2 \
+  --avg_output 1 \
+  --model qwen \
+  --output_name config_1p5b_second
