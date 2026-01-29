@@ -41,8 +41,8 @@ public:
     void deserialize(vector<sc_bv<128>> buffer);
     void printSelf();
 
-    Recv_prim() { name = "Recv_prim"; }
-    Recv_prim(RECV_TYPE type) : type(type) { name = "Recv_prim"; }
+    Recv_prim() : type(RECV_TYPE::RECV_DATA), tag_id(0), recv_cnt(0) { name = "Recv_prim"; }
+    Recv_prim(RECV_TYPE type) : type(type), tag_id(0), recv_cnt(0) { name = "Recv_prim"; }
     Recv_prim(RECV_TYPE type, int tag, int cnt)
         : type(type), tag_id(tag), recv_cnt(cnt) {
         name = "Recv_prim";

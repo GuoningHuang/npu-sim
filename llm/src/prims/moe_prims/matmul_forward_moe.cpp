@@ -27,16 +27,20 @@ void matmul_forward_moe::taskCore(TaskCoreContext &context, string prim_name,
     auto &selected_freq = prim_context->selected_freq_;
     auto &prefetched_experts = prim_context->prefetched_experts_;
 
+    cout << "[DEBUG] matmul_forward_moe: E_N=" << p["E_N"] 
+         << " K=" << p["K"] 
+         << " need_choose=" << p["need_choose"] 
+         << " selected_experts.size()=" << selected_experts.size() << endl;
+
     // 判断是否需要重选专家
+    int expert_count = p["E_N"];
     if (p["need_choose"]) {
         selected_experts.clear();
 
         LOG_DEBUG(PRIM) << name << " of Core " << prim_context->cid
                         << " Selecting experts...";
 
-        bool exp_flag[p["E_N"]];
-        for (auto &b : exp_flag)
-            b = false;
+        std::vector<bool> exp_flag(expert_count, false);
 
         for (auto e : selected_experts)
             exp_flag[e] = true;
@@ -81,9 +85,7 @@ void matmul_forward_moe::taskCore(TaskCoreContext &context, string prim_name,
     }
 
     // 优先查看是否有被prefetch的专家
-    bool checked[selected_experts.size()];
-    for (int i = 0; i < selected_experts.size(); i++)
-        checked[i] = false;
+    std::vector<bool> checked(expert_count, false);
 
     for (auto e : selected_experts) {
         // if (std::find(prefetched_experts.begin(), prefetched_experts.end(),
