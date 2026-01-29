@@ -58,7 +58,7 @@ def init_vars(input_vars):
     if ep > 1:
         # Parse TP from tp string
         tp_parts = input_vars['tp'].split("_")
-        tp = int(tp_parts[0])
+        tp = int(tp_parts[0])* int(tp_parts[1])
 
         # MoE-related variables
         input_vars['moeIS'] = input_vars['IS']
@@ -111,7 +111,7 @@ def process_source(input_vars):
     # EP mode: sources only for Attention cores in the first pp stage of each dp group
     ep = input_vars.get('ep', 1)
     if ep > 1:
-        tp = input_vars['mn']
+        tp = input_vars['mn']*input_vars['k']
         pp = input_vars['pp']
         dp = input_vars['dp']
         source = []
@@ -1536,7 +1536,7 @@ def process_cores_ep_mode(input_vars):
     - Attention core i: base + i (i = 0..TP-1)
     - MoE core j: base + TP + j (j = 0..EP-1)
     """
-    tp = input_vars['mn']
+    tp = input_vars['mn'] * input_vars['k']
     ep = input_vars['ep']
     dp = input_vars['dp']
     pp = input_vars['pp']
