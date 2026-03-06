@@ -2,7 +2,7 @@ import os
 import re
 
 # --- 配置区 ---
-LOG_BASE_DIR = "./run_logs" 
+LOG_BASE_DIR = "./run_logs2" 
 
 def clean_ansi(text):
     """清理 ANSI 颜色转义代码"""

@@ -10,7 +10,7 @@ void load_expert::initialize() {
     data_size_input = {0};
     data_chunk = {{"output", 0}};
 
-    for (int i = 1; i <= p["E_N"]; i++) {
+    for (int i = 0; i < p["E_N"]; i++) {
         for (int j = 1; j <= 3; j++) {
             data_chunk.push_back({"weight_" + to_string(j) + "_" + to_string(i),
                                   p["C"] * p["OC"]});
@@ -35,16 +35,26 @@ void load_expert::taskCore(TaskCoreContext &context, string prim_name,
     if (p["strategy"] == MOE_LOAD_STRATEGY_HOT) {
         exp_1 = 0;
         int max_cnt = -1;
-        for (int i = 0; i < prim_context->selected_experts_.size(); i++) {
-            int cnt = prim_context->selected_freq_[i];
-            if (cnt > max_cnt) {
-                max_cnt = cnt;
-                exp_1 = i;
+        if (!prim_context->selected_experts_.empty()) {
+            for (int i = 0; i < prim_context->selected_experts_.size(); i++) {
+                int e = prim_context->selected_experts_[i];
+                int cnt = 0;
+                if (e >= 0 && e < prim_context->selected_freq_.size()) {
+                    cnt = prim_context->selected_freq_[e];
+                }
+                if (cnt > max_cnt) {
+                    max_cnt = cnt;
+                    exp_1 = e;
+                }
             }
+        } else {
+            exp_1 = rand() % p["E_N"];
         }
     }
 
     else if (p["strategy"] == MOE_LOAD_STRATEGY_RANDOM) {
+        exp_1 = rand() % p["E_N"];
+    } else {
         exp_1 = rand() % p["E_N"];
     }
 

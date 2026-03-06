@@ -1,10 +1,54 @@
 #include "prims/moe_prims.h"
 #include "utils/memory_utils.h"
+#include "utils/config_utils.h"
 #include "utils/prim_utils.h"
 #include "utils/print_utils.h"
 #include "utils/system_utils.h"
 
 REGISTER_PRIM(matmul_forward_moe);
+
+namespace {
+uint32_t NextLcg(uint32_t state) {
+    return (1103515245u * state + 12345u) & 0x7fffffffu;
+}
+
+std::vector<int> SampleUniqueLcg(int total, int count, uint32_t seed) {
+    std::vector<int> out;
+    if (total <= 0 || count <= 0)
+        return out;
+    if (count > total)
+        count = total;
+
+    std::vector<bool> used(total, false);
+    uint32_t state = seed & 0x7fffffffu;
+    while ((int)out.size() < count) {
+        state = NextLcg(state);
+        int cand = (int)(state % (uint32_t)total);
+        if (!used[cand]) {
+            used[cand] = true;
+            out.push_back(cand);
+        }
+    }
+    return out;
+}
+} // namespace
+
+void matmul_forward_moe::parseJson(json j) {
+    json j_with_defaults = j;
+    if (!j_with_defaults.contains("route_mode"))
+        j_with_defaults["route_mode"] = 0;
+    if (!j_with_defaults.contains("route_seed"))
+        j_with_defaults["route_seed"] = 0;
+    if (!j_with_defaults.contains("route_global_en"))
+        j_with_defaults["route_global_en"] =
+            j_with_defaults.contains("E_N") ? j_with_defaults["E_N"] : json(0);
+    if (!j_with_defaults.contains("route_global_k"))
+        j_with_defaults["route_global_k"] =
+            j_with_defaults.contains("K") ? j_with_defaults["K"] : json(0);
+    if (!j_with_defaults.contains("route_local_begin"))
+        j_with_defaults["route_local_begin"] = 0;
+    NpuBase::parseJson(j_with_defaults);
+}
 
 void matmul_forward_moe::initialize() {
     auto &p = param_value;
@@ -40,29 +84,35 @@ void matmul_forward_moe::taskCore(TaskCoreContext &context, string prim_name,
         LOG_DEBUG(PRIM) << name << " of Core " << prim_context->cid
                         << " Selecting experts...";
 
-        std::vector<bool> exp_flag(expert_count, false);
+        if (p["route_mode"]) {
+            int global_en = p["route_global_en"];
+            int global_k = p["route_global_k"];
+            int local_begin = p["route_local_begin"];
+            auto chosen_global =
+                SampleUniqueLcg(global_en, global_k, (uint32_t)p["route_seed"]);
 
-        for (auto e : selected_experts)
-            exp_flag[e] = true;
+            for (auto g : chosen_global) {
+                if (g >= local_begin && g < local_begin + expert_count) {
+                    selected_experts.push_back(g - local_begin);
+                }
+            }
+            if ((int)selected_experts.size() != p["K"]) {
+                LOG_ERROR(matmul_forward_moe.cpp)
+                    << "route_mode selected_experts size mismatch: "
+                    << selected_experts.size() << " != " << p["K"];
+                return;
+            }
+        } else {
+            std::vector<bool> exp_flag(expert_count, false);
 
-        for (auto &e : selected_experts) {
-            if (RandResult(50))
-                continue; // 50%概率不重选
-
-            exp_flag[e] = false;
-            do {
-                e = rand() % p["E_N"];
-            } while (exp_flag[e]);
-            exp_flag[e] = true;
-        }
-
-        for (int i = selected_experts.size(); i < p["K"]; i++) {
-            int s_exp;
-            do {
-                s_exp = rand() % p["E_N"];
-            } while (exp_flag[s_exp]);
-            exp_flag[s_exp] = true;
-            selected_experts.push_back(s_exp);
+            for (int i = 0; i < p["K"]; i++) {
+                int s_exp;
+                do {
+                    s_exp = rand() % p["E_N"];
+                } while (exp_flag[s_exp]);
+                exp_flag[s_exp] = true;
+                selected_experts.push_back(s_exp);
+            }
         }
 
         while (selected_freq.size() < p["E_N"])

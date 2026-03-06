@@ -2,27 +2,37 @@
 
 # --- 1. 配置参数 ---
 MODEL_NAME="qwen3-30b"
-EP=$1
-TP=$2
-DP=$3
-PP=$4
+DP=$1
+PP=$2
+EP=$3
+TP=$4
 
 # 自动生成文件名，避免手动硬编码路径
 LOG_DIR = "${MODEL_NAME}_DP${DP}_PP${PP}_EP${EP}_TP${TP}"
-WORKLOAD_FILE="./${MODEL_NAME}_EP${EP}_TP${TP}_DP${DP}_PP${PP}.json"
+WORKLOAD_FILE="./${MODEL_NAME}_DP${DP}_PP${PP}_EP${EP}_TP${TP}.json"
 LOG_FILE="${MODEL_NAME}_DP${DP}_PP${PP}_EP${EP}_TP${TP}.txt"
 
 # --- 2. 生成 Workload 配置 ---
 echo "Generating workload: $WORKLOAD_FILE ..."
 
-# 注意：变量引用需要加 $ 符号
-python3 /home/code/npu-sim/llm/test/tool_script/moe_workload_gen.py \
-    --preset "$MODEL_NAME" \
-    --dp "$DP" \
-    --pp "$PP" \
-    --ep "$EP" \
-    --tp "$TP" \
-    --file_name "$WORKLOAD_FILE"
+if [ "$PP" -gt 1 ]; then
+    python3 /home/code/npu-sim/llm/test/tool_script/moe_workload_gen.py \
+        --preset "$MODEL_NAME" \
+        --dp "$DP" \
+        --pp "$PP" \
+        --ep "$EP" \
+        --tp "$TP" \
+        --B 8 \
+        --file_name "$WORKLOAD_FILE"
+else
+    python3 /home/code/npu-sim/llm/test/tool_script/moe_workload_gen_without_pp.py \
+        --preset "$MODEL_NAME" \
+        --dp "$DP" \
+        --ep "$EP" \
+        --tp "$TP" \
+        --B 8 \
+        --file_name "$WORKLOAD_FILE"
+fi
 
 # 检查上一步是否成功
 if [ $? -ne 0 ]; then
@@ -43,7 +53,7 @@ echo "Starting simulation, logging to $LOG_FILE ..."
 echo "Simulation completed successfully."
 
 # --- 4. 移动文件逻辑 (新增) ---
-DEST_BASE_DIR="../run_logs" # 归档的总目录
+DEST_BASE_DIR="../run_logs2" # 归档的总目录
 FINAL_DEST="${DEST_BASE_DIR}/${MODEL_NAME}_DP${DP}_PP${PP}_EP${EP}_TP${TP}"
 
 echo "Moving files to ${FINAL_DEST} ..."

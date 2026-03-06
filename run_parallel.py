@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 # --- 配置区 ---
 SH_FILE = "run.sh"
 TOTAL_CORES = 16
-TEMP_BASE_PREFIX = "temp_EP"
+TEMP_BASE_PREFIX = "temp"
 
 # 全局变量，记录创建的文件夹
 created_folders = []
@@ -21,7 +21,7 @@ def get_combinations(target):
     configs = []
     factors = [i for i in range(1, target + 1) if target % i == 0]
     for dp in factors:
-        for pp in factors:
+        for pp in [p for p in factors if p > 0]:
             if target % (dp * pp) != 0: continue
             sum_total = target // (dp * pp)
             for ep in range(1, sum_total):
@@ -32,7 +32,7 @@ def get_combinations(target):
                         configs.append({
                             "ep": ep, "tp_str": f"{mn}_{k}",
                             "dp": dp, "pp": pp,
-                            "folder": f"{TEMP_BASE_PREFIX}{ep}_TP{mn}_{k}_DP{dp}_PP{pp}"
+                            "folder": f"{TEMP_BASE_PREFIX}DP{dp}_PP{pp}_EP{ep}_TP{mn}_{k}"
                         })
     return configs
 
@@ -72,7 +72,7 @@ def execute_job(config):
         # 2. 运行脚本
         print(f"🚀 [开始] {config['folder']}")
         result = subprocess.run(
-            ["bash", SH_FILE, str(config['ep']), config['tp_str'], str(config['dp']), str(config['pp'])],
+            ["bash", SH_FILE, str(config['dp']), str(config['pp']), str(config['ep']), config['tp_str']],
             cwd=run_dir,
             capture_output=True,
             text=True

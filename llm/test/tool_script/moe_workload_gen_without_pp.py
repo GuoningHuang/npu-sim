@@ -65,6 +65,9 @@ def init_vars(input_vars):
         input_vars[f'moeIS/{ep}'] = input_vars['IS'] // ep
         input_vars['K'] = input_vars['topk']
         input_vars['E_N'] = input_vars['experts']
+        # expert_wise mode variables
+        input_vars[f'BTCK/{ep}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] * input_vars['topk'] // ep
+        input_vars[f'E_N/{ep}'] = input_vars['experts'] // ep
 
         # QKV dimension (3C-R means Q + K + V for GQA)
         qkv_dim = int(input_vars["C"] + 2 * input_vars["C"] / input_vars["R"])
@@ -108,15 +111,14 @@ def add_vars(input_vars, keys):
 
 
 def process_source(input_vars):
-    # EP mode: sources only for Attention cores in the first pp stage of each dp group
+    # EP mode: sources only for Attention cores in each dp group (no pp)
     ep = input_vars.get('ep', 1)
     if ep > 1:
         tp = input_vars['mn']*input_vars['k']
-        pp = input_vars['pp']
         dp = input_vars['dp']
         source = []
         for d in range(dp):
-            base = d * pp * (tp + ep)
+            base = d * (tp + ep)
             for i in range(tp):
                 source.append({"dest": base + i, "size": "BTC"})
         add_vars(input_vars, "BTC")
@@ -134,9 +136,9 @@ def process_source(input_vars):
                 else:
                     size =f"BTP/{mn_num}"
                 if mn_num == 1:
-                    dest_id = dp_index * k_num * mn_num * input_vars['pp'] + mn_index * input_vars['mn'] + k_index
+                    dest_id = dp_index * k_num * mn_num + mn_index * input_vars['mn'] + k_index
                 else:
-                    dest_id = dp_index * k_num * mn_num * input_vars['pp'] + k_index * input_vars['mn'] + mn_index
+                    dest_id = dp_index * k_num * mn_num + k_index * input_vars['mn'] + mn_index
 
                 # print(dest_id)
                 source.append({"dest": dest_id, "size": size})
@@ -218,7 +220,6 @@ llama = ["rmsnorm", "matmul_rope", "attention", "matmul", "residual", "rmsnorm",
 # Replacing the MLP block with MoE block: load -> up -> gelu -> down
 moe_gpt = ["layernorm", "matmul", "attention", "matmul", "residual", "layernorm", "load_expert", "moe_up", "gelu", "moe_down", "residual"]
 moe_qwen = ["rmsnorm", "matmul_rope", "attention", "matmul", "residual", "rmsnorm", "moe_up×2", "swiglu", "moe_down", "residual"]
-
 
 
 def produce_recv_cast_tag(recv_id, core_id, cast_id, base_tag=64):
@@ -407,60 +408,73 @@ def process_one_work_mnk(input_vars, operation, core_layer, core_id, mn_cast_id,
                 oc = "P"
                 ln_num += 1
             elif "load_expert" in operates:
-                # E_N, K, OC, C, strategy
-                # strategy: 0=NONE, 1=HOT, 2=RANDOM. Let's use 2 (RANDOM) as default for generating traffic
                 le_prim = {
                     "type": "load_expert",
                     "E_N": input_vars["experts"],
                     "K": input_vars["topk"],
                     "C": "P",
                     "OC": "J", # Expert Hidden Size
-                    "strategy": 2, 
+                    "strategy": 2,
                     "sram_address": {
-                        "indata": "TODO", # load_expert doesn't use sram_address in taskCore logic explicitly for data flow?
+                        "indata": "TODO",
                         "outdata": "TODO"
                     }
                 }
                 prims_list.append(le_prim)
             elif "moe_up" in operates:
-                # matmul_forward_moe
-                # B, T, C, OC, K, E_N, is_merge
+                moe_time = operates.split("×")[1:]
+                if len(moe_time) == 0:
+                    moe_time = 1
+                else:
+                    moe_time = int(moe_time[0])
+
                 if input_vars['mn'] != 1:
                     T = f"T/{input_vars['mn']}"
                 else:
                     T = "T"
                 add_vars(input_vars, T)
-                
-                moe_prim = {
-                    "type": "matmul_forward_moe",
-                    "B": B,
-                    "T": T,
-                    "C": "P",
-                    "OC": "J",
-                    "K": input_vars["topk"],
-                    "E_N": input_vars["experts"],
-                    "is_merge": False,
-                    "need_choose": True, # First one chooses experts
-                    "sram_address": {
-                        "indata": sram_indata,
-                        "outdata": f"moe_up{moe_up_num}_out"
-                    },
-                    "dram_address": {
-                        "data": f"moe_up{moe_up_num}_data"
+
+                original_indata = sram_indata
+                swiglu_indata = ""
+                for moe_idx in range(moe_time):
+                    if moe_time > 1 and moe_idx < moe_time - 1:
+                        moe_indata = f"_{original_indata}"
+                    else:
+                        moe_indata = original_indata
+
+                    moe_prim = {
+                        "type": "matmul_forward_moe",
+                        "B": B,
+                        "T": T,
+                        "C": "P",
+                        "OC": "J",
+                        "K": input_vars["topk"],
+                        "E_N": input_vars["experts"],
+                        "is_merge": False,
+                        "need_choose": (moe_idx == 0),
+                        "sram_address": {
+                            "indata": moe_indata,
+                            "outdata": f"moe_up{moe_up_num}_out"
+                        },
+                        "dram_address": {
+                            "data": f"moe_up{moe_up_num}_data"
+                        }
                     }
-                }
-                prims_list.append(moe_prim)
-                sram_indata = f"moe_up{moe_up_num}_out"
+                    prims_list.append(moe_prim)
+
+                    if moe_time > 1:
+                        swiglu_indata += f"moe_up{moe_up_num}_out "
+
+                    sram_indata = f"moe_up{moe_up_num}_out"
+                    moe_up_num += 1
+
                 oc = "J" # Intermediate
-                moe_up_num += 1
             elif "moe_down" in operates:
-                # matmul_forward_moe
-                # B, T, C, OC, K, E_N, is_merge
                 if input_vars['mn'] != 1:
                     T = f"T/{input_vars['mn']}"
                 else:
                     T = "T"
-                
+
                 moe_prim = {
                     "type": "matmul_forward_moe",
                     "B": B,
@@ -481,6 +495,7 @@ def process_one_work_mnk(input_vars, operation, core_layer, core_id, mn_cast_id,
                 }
                 prims_list.append(moe_prim)
                 sram_indata = f"moe_down{moe_down_num}_out"
+                res_end = f"moe_down{moe_down_num}_out"
                 oc = "P" # Back to HS
                 moe_down_num += 1
             elif "matmul" in operates:
@@ -911,19 +926,16 @@ def process_one_work_mnk(input_vars, operation, core_layer, core_id, mn_cast_id,
                 }
 
                 if num == 9 and layer_index == core_layer-1:
-                    if not last_layer:
-                        res_prim["cast"] = [dict(dest=core_id + input_vars['k'] * input_vars['mn'])]
-                    else:
-
-                        loop_id = core_id - input_vars['k'] * input_vars['mn'] * (input_vars["pp"] - 1)
-                        res_prim["cast"] = [{
-                                "dest": -1,
-                                "loopout": "true"
-                            },
-                            {
-                                "dest": loop_id,
-                                "loopout": "false"
-                            }]
+                    # No pp: always last layer, loop back to self                                                                                                                   
+                    loop_id = core_id                                                                                                                                               
+                    res_prim["cast"] = [{                                                                                                                                           
+                                "dest": -1,                                                                                                                                             
+                            "loopout": "true"                                                                                                                                       
+                        },                                                                                                                                                          
+                            {                                                                                                                                                           
+                            "dest": loop_id,                                                                                                                                        
+                                "loopout": "false"                                                                                                                                      
+                            }]  
 
                 prims_list.append(res_prim)
                 sram_indata = f"_residual{res_num}_out"
@@ -974,20 +986,6 @@ def process_worklist_mnk(input_vars, core_id, core_layer, operation, mn_cast_id,
     pirms = process_one_work_mnk(input_vars, operation, core_layer, core_id, mn_cast_id, mn_recv_id, k_cast_id, k_recv_id, last_layer)
     worklist = split_prims(pirms, core_id)
     return worklist
-
-
-def layer_adapt_pp(input_vars):
-    cores_list = []
-    if input_vars["pp"] >= input_vars["L"]:
-        cores_list = [1] * input_vars["L"]
-    else:
-        cores_num = int(input_vars["L"] / input_vars["pp"])
-        cores_list = [cores_num] * input_vars["pp"]
-        addtional_op_num = input_vars["L"] - cores_num * input_vars["pp"]
-        for i in range(addtional_op_num):
-            cores_list[i] = cores_list[i] + 1
-
-    return cores_list
 
 
 def generate_ring_allreduce_worklist(parallelism, core_index, size, is_first_core_type=True):
@@ -1145,15 +1143,15 @@ def generate_ring_allreduce_worklist_ep(ep, core_index, size, base_core_id):
     return worklist
 
 
-def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, pp_stage_index, pp_total, dp_index, base_id, moe_base_id):
+def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, dp_index, base_id, moe_base_id, loop_count=1, ep_mode='is_split'):
     """
-    Generate worklist for Attention Core in EP mode with dp/pp support.
+    Generate worklist for Attention Core in EP mode without pp.
 
     Per layer, the structure is:
     - Main computation: parse_input(layer 0 only) + rmsnorm + Matmul(QKV) + rope + Attention + Matmul(O) + switch_data
     - Ring All-Reduce (TP dimension)
     - Residual + rmsnorm + gate_forward + cast to all MoE cores
-    - recv from MoE + final Residual (with pp cast on last layer)
+    - recv from MoE + final Residual (with loop cast on last layer)
     """
     worklist = []
 
@@ -1166,13 +1164,11 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
     add_vars(input_vars, f"NH/{tp}")
     add_vars(input_vars, "3BTC/4")
 
-    is_last_pp_stage = (pp_stage_index == pp_total - 1)
-    next_stage_core = base_id + (tp + ep) + core_index
-    first_stage_core = dp_index * pp_total * (tp + ep) + core_index
+    total_layers = core_layer * loop_count
 
-    for layer_idx in range(core_layer):
+    for layer_idx in range(total_layers):
         is_first_layer = (layer_idx == 0)
-        is_last_layer = (layer_idx == core_layer - 1)
+        is_last_layer = (layer_idx == total_layers - 1)
 
         # --- Main computation worklist item ---
         if is_first_layer:
@@ -1264,11 +1260,8 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
 
         # --- Ring All-Reduce for TP ---
         if tp > 1:
-            # Sequential broadcast: in phase i, core i sends to all others.
-            # This avoids deadlock because only one core sends at a time.
             for phase in range(tp):
                 if phase == core_index:
-                    # This core broadcasts
                     cast_list = [{"dest": base_id + i, "tag": 50} for i in range(tp) if i != core_index]
                     worklist.append({
                         "recv_cnt": 0,
@@ -1280,7 +1273,6 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
                         }]
                     })
                 else:
-                    # This core receives
                     worklist.append({
                         "recv_cnt": 1,
                         "recv_tag": 50,
@@ -1293,9 +1285,10 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
                     })
 
         # --- Dispatch: Residual + rmsnorm + gate_forward + cast to MoE cores ---
-        dispatch_cast = []
-        for moe_idx in range(ep):
-            dispatch_cast.append({"dest": moe_base_id + moe_idx, "weight": tp, "tag": 80})
+        if ep_mode == 'expert_wise':
+            dispatch_cast = [{"dest": moe_base_id + moe_idx, "tag": 70} for moe_idx in range(ep)]
+        else:
+            dispatch_cast = [{"dest": moe_base_id + moe_idx, "weight": tp, "tag": 80} for moe_idx in range(ep)]
 
         if is_first_layer:
             res1_indata = "rmsnorm1_in matmul2_out"
@@ -1327,12 +1320,28 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
                 "sram_address": {"indata": "_rmsnorm2_out", "outdata": "gate_out"},
                 "dram_address": {"data": -1}
             },
-            {
+        ]
+
+        if ep_mode == 'expert_wise':
+            dispatch_prims += [
+                {
+                    "type": "switch_data",
+                    "IN": "BTC",
+                    "OUT": f"BTCK/{ep}",
+                    "sram_address": {"indata": "_rmsnorm2_out", "outdata": "dispatch_switch_out"}
+                },
+                {
+                    "type": "parse_output",
+                    "size": f"BTCK/{ep}",
+                    "sram_address": {"indata": "dispatch_switch_out", "outdata": "dispatch_switch_out"}
+                }
+            ]
+        else:
+            dispatch_prims.append({
                 "type": "parse_output",
                 "size": "BTC",
                 "sram_address": {"indata": "rmsnorm2_out", "outdata": "rmsnorm2_out"}
-            }
-        ]
+            })
 
         worklist.append({
             "recv_cnt": 0,
@@ -1341,8 +1350,9 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
         })
 
         # --- Padding to align with MoE return ---
-        # MoE side has ep AR steps (sequential broadcast) if ep > 1.
-        pad_steps = ep if ep > 1 else 0
+        # is_split: wait ep steps for EP All-Reduce on MoE side
+        # expert_wise: no EP All-Reduce, so no padding needed
+        pad_steps = (ep if ep > 1 else 0) if ep_mode == 'is_split' else 0
         for _ in range(pad_steps):
             worklist.append({
                 "recv_cnt": 0,
@@ -1361,13 +1371,7 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
         ]
 
         if is_last_layer:
-            if not is_last_pp_stage:
-                final_cast = [{"dest": next_stage_core}]
-            else:
-                final_cast = [
-                    {"dest": -1, "loopout": "true"},
-                    {"dest": first_stage_core, "loopout": "false"}
-                ]
+            final_cast = [{"dest": -1}]
         else:
             final_cast = []
 
@@ -1381,9 +1385,9 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, ep, core_laye
     return worklist
 
 
-def process_moe_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, base_id, moe_base_id):
+def process_moe_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, base_id, moe_base_id, loop_count=1):
     """
-    Generate worklist for MoE Core in EP mode with dp/pp support.
+    Generate worklist for MoE Core in EP mode without pp.
 
     Per layer, the structure is:
     - recv_cnt=TP + MoE computation (matmul_moe x3 + swiglu + switch_data)
@@ -1396,9 +1400,10 @@ def process_moe_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, bas
     add_vars(input_vars, f"moeIS/{ep}")
     add_vars(input_vars, f"BTC/{ep}")
 
-    for layer_idx in range(core_layer):
+    total_layers = core_layer * loop_count
+
+    for layer_idx in range(total_layers):
         # --- Padding to align with Attention dispatch ---
-        # Attn side has 1 (Main) + tp AR steps (sequential broadcast) if tp > 1.
         pad_steps = 1 + (tp if tp > 1 else 0)
         for _ in range(pad_steps):
             worklist.append({
@@ -1477,11 +1482,8 @@ def process_moe_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, bas
 
         # --- Ring All-Reduce for EP ---
         if ep > 1:
-            # Sequential broadcast: in phase i, core i sends to all others.
-            # This avoids deadlock because only one core sends at a time.
             for phase in range(ep):
                 if phase == core_index:
-                    # This core broadcasts
                     cast_list = [{"dest": moe_base_id + i, "tag": 60} for i in range(ep) if i != core_index]
                     worklist.append({
                         "recv_cnt": 0,
@@ -1493,7 +1495,6 @@ def process_moe_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, bas
                         }]
                     })
                 else:
-                    # This core receives
                     worklist.append({
                         "recv_cnt": 1,
                         "recv_tag": 60,
@@ -1517,64 +1518,181 @@ def process_moe_core_worklist_ep(input_vars, core_index, tp, ep, core_layer, bas
             }]
         })
 
-    # Empty worklist (terminator)
-    worklist.append({
-        "cast": [],
-        "recv_cnt": 0,
-        "prims": []
-    })
+    return worklist
+
+
+def process_moe_core_worklist_ep_expert_wise(input_vars, core_index, tp, ep, core_layer, base_id, moe_base_id, loop_count=1):
+    """
+    Generate worklist for MoE Core in EP expert_wise mode without pp.
+
+    Each core holds E_N/ep complete experts (full IS).
+    Tokens are dispatched via All-to-All (tag 70) and combined back (tag 81).
+    No EP All-Reduce needed since experts are disjoint across MoE cores.
+    """
+    worklist = []
+
+    en_local = input_vars['experts'] // ep
+    input_vars[f'E_N/{ep}'] = en_local
+    add_vars(input_vars, f"BTCK/{ep}")
+    add_vars(input_vars, f"BTC/{ep}")
+
+    en_ep_str = f"E_N/{ep}" if ep > 1 else "E_N"
+
+    total_layers = core_layer * loop_count
+
+    for layer_idx in range(total_layers):
+        # --- Padding to align with Attention main + TP All-Reduce ---
+        pad_steps = 1 + (tp if tp > 1 else 0)
+        for _ in range(pad_steps):
+            worklist.append({
+                "recv_cnt": 0,
+                "cast": [],
+                "prims": []
+            })
+
+        # --- MoE computation (recv dispatch from all attention cores) ---
+        moe_prims = [
+            {
+                "type": "parse_input",
+                "size": f"BTCK/{ep}",
+                "sram_address": {"indata": "input_label", "outdata": "input_label"}
+            },
+            {
+                "type": "load_expert",
+                "E_N": en_ep_str,
+                "K": "K",
+                "C": "C",
+                "OC": "moeIS",
+                "need_choose": False,
+                "strategy": 2,
+                "sram_address": {
+                    "indata": "gate_out input_label matmul_moe1_data matmul_moe2_data matmul_moe3_data",
+                    "outdata": "load_expert_out"
+                }
+            },
+            {
+                "type": "matmul_forward_moe",
+                "B": "B",
+                "T": "T",
+                "C": "C",
+                "OC": "moeIS",
+                "K": "K",
+                "E_N": en_ep_str,
+                "need_choose": True,
+                "is_merge": False,
+                "sram_address": {"indata": "_input_label", "outdata": "matmul_moe1_out"},
+                "dram_address": {"data": "matmul_moe1_data", "out": "TODO"}
+            },
+            {
+                "type": "matmul_forward_moe",
+                "use_hw": False,
+                "B": "B",
+                "T": "T",
+                "C": "C",
+                "OC": "moeIS",
+                "K": "K",
+                "E_N": en_ep_str,
+                "need_choose": False,
+                "is_merge": False,
+                "sram_address": {"indata": "input_label", "outdata": "matmul_moe2_out"},
+                "dram_address": {"data": "matmul_moe2_data", "out": "TODO"}
+            },
+            {
+                "type": "swiglu_forward",
+                "N": "moeIS",
+                "sram_address": {"indata": "matmul_moe1_out matmul_moe2_out", "outdata": "swiglu1_out"},
+                "dram_address": {"input": 0, "data": -1}
+            },
+            {
+                "type": "matmul_forward_moe",
+                "B": "B",
+                "T": "T",
+                "C": "moeIS",
+                "OC": "C",
+                "K": "K",
+                "E_N": en_ep_str,
+                "need_choose": False,
+                "is_merge": True,
+                "sram_address": {"indata": "swiglu1_out", "outdata": "matmul_moe3_out"},
+                "dram_address": {"data": "matmul_moe3_data", "out": "TODO"}
+            },
+        ]
+
+        worklist.append({
+            "cast": [],
+            "recv_cnt": tp,
+            "recv_tag": 70,
+            "prims": moe_prims
+        })
+
+        # --- No EP All-Reduce (experts are disjoint, each MoE core has complete local experts) ---
+
+        # --- Cast result back to ALL Attention cores ---
+        cast_list = [{"dest": base_id + i, "tag": 81} for i in range(tp)]
+        worklist.append({
+            "recv_cnt": 0,
+            "cast": cast_list,
+            "prims": [{
+                "type": "parse_output",
+                "size": "BTC",
+                "sram_address": {"indata": "matmul_moe3_out", "outdata": "matmul_moe3_out"}
+            }]
+        })
 
     return worklist
 
 
 def process_cores_ep_mode(input_vars):
     """
-    Process cores in EP (Expert Parallelism) mode with dp/pp support.
+    Process cores in EP (Expert Parallelism) mode without pp.
 
-    Core ID scheme:
-    - Per-stage group: TP attention cores + EP MoE cores = (TP + EP)
-    - Per-dp-group: pp * (TP + EP)
-    - Total: dp * pp * (TP + EP)
+    Core ID scheme (no pp):
+    - Per-dp-group: TP attention cores + EP MoE cores = (TP + EP)
+    - Total: dp * (TP + EP)
 
-    For dp_index d, pp_stage s:
-    - base = d * pp * (TP + EP) + s * (TP + EP)
+    For dp_index d:
+    - base = d * (TP + EP)
     - Attention core i: base + i (i = 0..TP-1)
     - MoE core j: base + TP + j (j = 0..EP-1)
     """
     tp = input_vars['mn'] * input_vars['k']
     ep = input_vars['ep']
     dp = input_vars['dp']
-    pp = input_vars['pp']
+    ep_mode = input_vars.get('ep_mode', 'is_split')
 
-    cores_list = layer_adapt_pp(input_vars)
+    if ep_mode == 'expert_wise' and ep > 1 and input_vars['experts'] % ep != 0:
+        raise ValueError(f"experts ({input_vars['experts']}) must be divisible by ep ({ep}) in expert_wise mode")
+
+    # All layers in a single stage (no pp)
+    core_layer = input_vars['L']
+    loop_count = input_vars.get('loop', 1)
+
+    moe_core_fn = process_moe_core_worklist_ep_expert_wise if ep_mode == 'expert_wise' else process_moe_core_worklist_ep
 
     cores = []
     for d in range(dp):
-        for s, core_layer in enumerate(cores_list):
-            base = d * pp * (tp + ep) + s * (tp + ep)
-            moe_base = base + tp
+        base = d * (tp + ep)
+        moe_base = base + tp
 
-            # Generate Attention Cores for this stage
-            for i in range(tp):
-                core = {
-                    "id": base + i,
-                    "loop": "loop",
-                    "worklist": process_attention_core_worklist_ep(
-                        input_vars, i, tp, ep, core_layer,
-                        s, pp, d, base, moe_base)
-                }
-                cores.append(core)
+        # Generate Attention Cores
+        for i in range(tp):
+            core = {
+                "id": base + i,
+                "worklist": process_attention_core_worklist_ep(
+                    input_vars, i, tp, ep, core_layer,
+                    d, base, moe_base, loop_count, ep_mode)
+            }
+            cores.append(core)
 
-            # Generate MoE Cores for this stage
-            for j in range(ep):
-                core = {
-                    "id": moe_base + j,
-                    "loop": "loop",
-                    "worklist": process_moe_core_worklist_ep(
-                        input_vars, j, tp, ep, core_layer,
-                        base, moe_base)
-                }
-                cores.append(core)
+        # Generate MoE Cores
+        for j in range(ep):
+            core = {
+                "id": moe_base + j,
+                "worklist": moe_core_fn(
+                    input_vars, j, tp, ep, core_layer,
+                    base, moe_base, loop_count)
+            }
+            cores.append(core)
 
     return cores
 
@@ -1586,72 +1704,65 @@ def process_cores(input_vars):
         return process_cores_ep_mode(input_vars)
 
     global core_id, mn_cast_id, mn_recv_id, k_cast_id, k_recv_id
-    cores_list = layer_adapt_pp(input_vars)
-    # print(cores_list)
 
-    # Force MoE decoder regardless of model/ep setting.
-    decoder = moe_gpt
+    # All layers in a single stage (no pp)
+    core_layer = input_vars['L']
+
+    decoder = gpt
     if input_vars['model'] == "qwen":
         decoder = moe_qwen
+    elif input_vars['model'] == "gpt":
+        decoder = moe_gpt
 
     cores = []
     for dp_index in range(input_vars['dp']):
-        for core_num, core_layer in enumerate(cores_list):
-            for k_index in range(input_vars["k"]):
-                for mn_index in range(input_vars["mn"]):
-                    dp_base = dp_index * input_vars['pp'] * input_vars['k'] * input_vars['mn']
-                    if input_vars['k'] != 1 and input_vars["mn"] != 1:
-                        core_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + k_index * input_vars["mn"] + mn_index
-                        if mn_index < input_vars["mn"] - 1:
-                            mn_cast_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + k_index * input_vars["mn"] + mn_index + 1
-                        else:
-                            mn_cast_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + (k_index-1) * input_vars["mn"] + mn_index + 1
-
-                        if mn_index > 0:
-                            mn_recv_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + k_index * input_vars["mn"] + mn_index - 1
-                        else:
-                            mn_recv_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + (k_index+1) * input_vars["mn"] + mn_index - 1
-
-                        if k_index < input_vars["k"] - 1 :
-                            k_cast_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + (k_index + 1) * input_vars["mn"] + mn_index
-                        else:
-                            k_cast_id = dp_base + (core_num - 1) * input_vars["k"] * input_vars["mn"] + (k_index + 1) * input_vars["mn"] + mn_index
-
-                        if k_index > 0:
-                            k_recv_id = dp_base + core_num * input_vars["k"] * input_vars["mn"] + (k_index - 1) * input_vars["mn"] + mn_index
-                        else:
-                            k_recv_id = dp_base + (core_num + 1) * input_vars["k"] * input_vars["mn"] + (k_index - 1) * input_vars["mn"] + mn_index
-                    elif input_vars['k'] == 1 and input_vars["mn"] != 1:
-                        core_id = core_num * input_vars["mn"] + mn_index
-                        mn_cast_id = dp_base + core_num * input_vars["mn"] + mn_index + 1 if mn_index < input_vars["mn"] - 1 else dp_base + core_num * input_vars["mn"]
-                        mn_recv_id = dp_base + core_num * input_vars["mn"] + mn_index - 1 if mn_index > 0 else dp_base + core_num * input_vars["mn"] + 3
-                        k_cast_id = None
-                        k_recv_id = None
-                    elif input_vars['k'] != 1 and input_vars["mn"] == 1:
-                        core_id = core_num * input_vars["k"] + k_index
-                        mn_cast_id = None
-                        mn_recv_id = None
-                        k_cast_id = dp_base + core_num * input_vars["k"] + k_index + 1 if k_index < input_vars["k"] - 1 else dp_base + core_num * input_vars["k"]
-                        k_recv_id = dp_base + core_num * input_vars["k"] + k_index - 1 if k_index > 0 else dp_base + core_num * input_vars["k"] + 3
+        for k_index in range(input_vars["k"]):
+            for mn_index in range(input_vars["mn"]):
+                dp_base = dp_index * input_vars['k'] * input_vars['mn']
+                if input_vars['k'] != 1 and input_vars["mn"] != 1:
+                    core_id = dp_base + k_index * input_vars["mn"] + mn_index
+                    if mn_index < input_vars["mn"] - 1:
+                        mn_cast_id = dp_base + k_index * input_vars["mn"] + mn_index + 1
                     else:
-                        core_id = dp_index * input_vars['pp'] + core_num
-                        mn_recv_id = None
-                        mn_cast_id = None
-                        k_recv_id = None
-                        k_cast_id = None
+                        mn_cast_id = dp_base + (k_index-1) * input_vars["mn"] + mn_index + 1
 
-                    # print(
-                    #     f"mn_recv_id: {mn_recv_id}, "
-                    #     f"k_recv_id: {k_recv_id}, "
-                    #     f"core_id: {core_id}, "
-                    #     f"mn_cast_id: {mn_cast_id}, "
-                    #     f"k_cast_id: {k_cast_id}"
-                    # )
+                    if mn_index > 0:
+                        mn_recv_id = dp_base + k_index * input_vars["mn"] + mn_index - 1
+                    else:
+                        mn_recv_id = dp_base + (k_index+1) * input_vars["mn"] + mn_index - 1
 
-                    core = {"id": core_id,
-                            "loop": "loop",
-                            "worklist": process_worklist_mnk(input_vars, core_id, core_layer, decoder, mn_cast_id, mn_recv_id, k_cast_id, k_recv_id, core_num == len(cores_list) - 1)}
-                    cores.append(core)
+                    if k_index < input_vars["k"] - 1 :
+                        k_cast_id = dp_base + (k_index + 1) * input_vars["mn"] + mn_index
+                    else:
+                        k_cast_id = dp_base + mn_index
+
+                    if k_index > 0:
+                        k_recv_id = dp_base + (k_index - 1) * input_vars["mn"] + mn_index
+                    else:
+                        k_recv_id = dp_base + (input_vars["k"] - 1) * input_vars["mn"] + mn_index
+                elif input_vars['k'] == 1 and input_vars["mn"] != 1:
+                    core_id = dp_base + mn_index
+                    mn_cast_id = dp_base + mn_index + 1 if mn_index < input_vars["mn"] - 1 else dp_base
+                    mn_recv_id = dp_base + mn_index - 1 if mn_index > 0 else dp_base + input_vars["mn"] - 1
+                    k_cast_id = None
+                    k_recv_id = None
+                elif input_vars['k'] != 1 and input_vars["mn"] == 1:
+                    core_id = dp_base + k_index
+                    mn_cast_id = None
+                    mn_recv_id = None
+                    k_cast_id = dp_base + k_index + 1 if k_index < input_vars["k"] - 1 else dp_base
+                    k_recv_id = dp_base + k_index - 1 if k_index > 0 else dp_base + input_vars["k"] - 1
+                else:
+                    core_id = dp_index
+                    mn_recv_id = None
+                    mn_cast_id = None
+                    k_recv_id = None
+                    k_cast_id = None
+
+                core = {"id": core_id,
+                        "loop": "loop",
+                        "worklist": process_worklist_mnk(input_vars, core_id, core_layer, decoder, mn_cast_id, mn_recv_id, k_cast_id, k_recv_id, True)}
+                cores.append(core)
     return cores
 
 
@@ -1701,11 +1812,6 @@ def apply_prim_copy_optimization(cores):
 
 def process_chips(input_vars):
     cores = process_cores(input_vars)
-    # Disable prim_copy optimization - it strips prims from worklist
-    # which causes uninitialized max_packet values in SEND_REQ
-    # ep = input_vars.get('ep', 1)
-    # if ep <= 1:
-    #     cores = apply_prim_copy_optimization(cores)
     chips = {"chip_id": 0, "cores": cores}
     return [chips]
 
@@ -1781,15 +1887,17 @@ def main():
     parser.add_argument("--KVH", type=int, help="KV heads", default=8, required=False)
     parser.add_argument("--HS", type=int, help="hidden size", default=2560, required=False)
     parser.add_argument("--L", type=int, help="transformer layers", default=1, required=False)
-    parser.add_argument("--pp", type=int, help="pipeline parallel", default=1, required=False)
     parser.add_argument("--dp", type=int, help="dataset parallel", default=1, required=False)
     parser.add_argument("--tp", type=str, help="tensor parallel, mn_k", default="1_1", required=False)
-    parser.add_argument("--IS", type=int, help="intermediate size (expert hidden size for moe)", default=14336, required=False) # e.g. Mixtral 8x7B has 14336
+    parser.add_argument("--IS", type=int, help="intermediate size (expert hidden size for moe)", default=14336, required=False)
     parser.add_argument("--avg_output", type=int, help="average output tokens", default=10, required=False)
     parser.add_argument("--model", type=str, help="gpt, qwen", default="qwen", required=False)
     parser.add_argument("--experts", type=int, help="number of experts", default=8, required=False)
     parser.add_argument("--topk", type=int, help="top k experts", default=2, required=False)
     parser.add_argument("--ep", type=int, help="expert parallelism", default=1, required=False)
+    parser.add_argument("--ep_mode", type=str, choices=["is_split", "expert_wise"],
+                        help="EP mode: is_split (split IS across MoE cores, EP All-Reduce) or expert_wise (each MoE core holds E_N/ep complete experts, Dispatch+Combine All-to-All)",
+                        default="is_split", required=False)
 
     args = parser.parse_args()
 
@@ -1833,9 +1941,12 @@ def main():
         "residual2_out": 0
     }
     input_vars = input_vars | varitations
+
+    # No pp: force pp=1 for init_vars compatibility
+    input_vars['pp'] = 1
     init_vars(input_vars)
 
-    # Build file name (include EP, dp, pp if > 1)
+    # Build file name (include EP, dp if > 1)
     ep = input_vars.get('ep', 1)
 
     input_vars['tp'] = input_vars['tp'].split("_")
@@ -1850,15 +1961,17 @@ def main():
     input_vars.pop('tp')
     input_vars.pop('model')
     input_vars.pop('file_name', None)  # Remove string field that breaks C++ parser
+    input_vars.pop('ep_mode', None)    # Remove string field that breaks C++ parser
     if 'ep' in input_vars and input_vars['ep'] <= 1:
         input_vars.pop('ep')
+    input_vars.pop('pp', None)  # Remove pp from output vars
+    input_vars.pop('loop', None)  # Remove loop from output vars (unrolled into worklist)  
+    # Only remove loop when in EP mode (loop is unrolled into worklist)
+    # In non-EP mode, cores reference "loop" variable for iteration count
 
-    # print(input_vars['tp'], input_vars['k'])
-    # print(configs)
     with open(args.file_name, "w", encoding="utf-8") as f:
         f.write(_compact_json(configs))
 
 
 if __name__ == '__main__':
     main()
-    

@@ -345,16 +345,18 @@ void config_helper_core::generate_prims(int i) {
         bool is_end = judge_is_end_work(work);
         if (is_end)
             end_cores++;
+        bool is_source_recv = is_source && work.recv_cnt > 0 &&
+                              work.recv_tag == c->id;
 
         // 非最后循环
         // loop = 1 的 时候只有last_loop 循环
-        add_recv(work.prims_in_loop, (is_source && w == 0), work.recv_tag,
+        add_recv(work.prims_in_loop, is_source_recv, work.recv_tag,
                  work.recv_cnt);
         add_comps(work.prims_in_loop, work.prims);
         add_sends(work.prims_in_loop, work.cast, false);
 
         // 最后循环
-        add_recv(work.prims_last_loop, (is_source && w == 0 && c->loop == 1),
+        add_recv(work.prims_last_loop, is_source_recv,
                  work.recv_tag, work.recv_cnt);
         add_comps(work.prims_last_loop, work.prims);
 

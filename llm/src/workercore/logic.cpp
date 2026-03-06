@@ -492,31 +492,49 @@ void WorkerCoreExecutor::recv_logic() {
                     // 如果tag不等同于id，则不允许查看start data buffer
                     ev_prim_recv_notice.notify(0, SC_NS);
 
+                    auto pop_matching_msg = [&](queue<Msg> &buffer,
+                                                Msg &matched) -> bool {
+                        queue<Msg> pending;
+                        bool found = false;
+                        while (!buffer.empty()) {
+                            Msg cur = buffer.front();
+                            buffer.pop();
+
+                            // tag_id == cid means this recv accepts any tag.
+                            bool is_match = (prim->tag_id == cid) ||
+                                            (cur.tag_id_ == prim->tag_id);
+                            if (!found && is_match) {
+                                matched = cur;
+                                found = true;
+                            } else {
+                                pending.push(cur);
+                            }
+                        }
+                        buffer = std::move(pending);
+                        return found;
+                    };
+
                     Msg temp;
-                    // 表示 当前周期该核有需要处理的msg 的recv包
-                    if (prim->type == RECV_DATA) {
-                        while (!msg_buffer_[MSG_TYPE::DATA].size())
-                            wait(ev_recv_msg_type_[MSG_TYPE::DATA]);
-
-                        temp = msg_buffer_[MSG_TYPE::DATA].front();
-                    } else if (prim->type == RECV_START) {
-                        while (!msg_buffer_[MSG_TYPE::S_DATA].size())
-                            wait(ev_recv_msg_type_[MSG_TYPE::S_DATA]);
-
-                        temp = msg_buffer_[MSG_TYPE::S_DATA].front();
+                    bool got_match = false;
+                    while (!got_match) {
+                        if (prim->type == RECV_DATA) {
+                            while (!msg_buffer_[MSG_TYPE::DATA].size())
+                                wait(ev_recv_msg_type_[MSG_TYPE::DATA]);
+                            got_match =
+                                pop_matching_msg(msg_buffer_[MSG_TYPE::DATA],
+                                                 temp);
+                            if (!got_match)
+                                wait(ev_recv_msg_type_[MSG_TYPE::DATA]);
+                        } else if (prim->type == RECV_START) {
+                            while (!msg_buffer_[MSG_TYPE::S_DATA].size())
+                                wait(ev_recv_msg_type_[MSG_TYPE::S_DATA]);
+                            got_match =
+                                pop_matching_msg(msg_buffer_[MSG_TYPE::S_DATA],
+                                                 temp);
+                            if (!got_match)
+                                wait(ev_recv_msg_type_[MSG_TYPE::S_DATA]);
+                        }
                     }
-
-                    if (prim->tag_id != cid && temp.tag_id_ != prim->tag_id) {
-                        LOG_ERROR(logic.cpp)
-                            << "Incompatible tag id at Core " << cid
-                            << ": prim tag " << prim->tag_id
-                            << ", with received tag " << temp.tag_id_;
-                    }
-
-                    if (prim->type == RECV_DATA)
-                        msg_buffer_[MSG_TYPE::DATA].pop();
-                    else
-                        msg_buffer_[MSG_TYPE::S_DATA].pop();
 
                     recv_cnt++;
 

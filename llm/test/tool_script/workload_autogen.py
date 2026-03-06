@@ -227,6 +227,7 @@ def add_rope(B, T, C, NH, R, sram_indata, rp_num, prims_list):
         "C": C,
         "NH": NH,
         "R": R,
+        "job_type": 2,
         "sram_address": {
             "indata": sram_indata,
             "outdata": f"rope{rp_num}_out"
