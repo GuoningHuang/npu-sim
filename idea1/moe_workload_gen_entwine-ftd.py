@@ -3,8 +3,6 @@ import json
 import argparse
 import re
 global input_vars
-SUMMARY_SENTINEL_TYPE = "Residual_f"
-SUMMARY_SENTINEL_OUT = "residual2_out"
 MOE_ROUTE_BASE_SEED = 12345
 
 
@@ -65,166 +63,6 @@ def _compact_json(obj, indent=4, level=0, compact=False):
         return json.dumps(obj)
 
 
-def _resolve_value(expr, vars_map):
-    """Return numeric value for a size expression if possible."""
-    if expr is None:
-        return None
-    if isinstance(expr, (int, float)):
-        return expr
-    if expr in vars_map:
-        return vars_map[expr]
-    try:
-        return int(expr)
-    except Exception:
-        pass
-    try:
-        [num, den], word_type = find_const(expr)
-        if word_type and word_type in vars_map:
-            return int(num * vars_map[word_type] / den)
-    except Exception:
-        pass
-    return None
-
-
-def _fmt_size(expr, vars_map):
-    val = _resolve_value(expr, vars_map)
-    return f"{expr} (= {val})" if val is not None else str(expr)
-
-
-def _pick_size_expr(prims):
-    for prim in prims:
-        for key in ("size", "OUT", "IN", "OC", "C", "N"):
-            if key in prim:
-                return prim[key]
-    return None
-
-
-def _is_layer_boundary(prim):
-    return prim.get("type") == SUMMARY_SENTINEL_TYPE and prim.get("sram_address", {}).get("outdata") == SUMMARY_SENTINEL_OUT
-
-
-def _print_table(headers, rows):
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(str(cell)))
-    line = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    sep = "-+-".join("-" * widths[i] for i in range(len(headers)))
-    print(line)
-    print(sep)
-    for row in rows:
-        print(" | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
-
-
-def _infer_dims(prim, vars_map):
-    """Return (in_shape, out_shape, in_elems, out_elems)."""
-    def gv(key, default=1):
-        return _resolve_value(prim.get(key), vars_map) or default
-
-    B = gv("B")
-    T = gv("T")
-    C = gv("C")
-    OC = gv("OC")
-    N = gv("N")
-
-    ptype = prim.get("type", "")
-    if "matmul" in ptype.lower():
-        in_e = B * T * C
-        out_e = B * T * OC
-        return (f"[{B*T}, {_fmt_size(prim.get('C','C'), vars_map)}]",
-                f"[{B*T}, {_fmt_size(prim.get('OC','OC'), vars_map)}]",
-                in_e, out_e)
-    if "attention" in ptype.lower():
-        in_e = B * T * C
-        out_e = B * T * C
-        return (f"[{B*T}, {_fmt_size(prim.get('C','C'), vars_map)}]",
-                f"[{B*T}, {_fmt_size(prim.get('C','C'), vars_map)}]",
-                in_e, out_e)
-    if "rmsnorm" in ptype.lower():
-        in_e = B * T * C
-        return (f"[{B*T}, {_fmt_size(prim.get('C','C'), vars_map)}]",
-                f"[{B*T}, {_fmt_size(prim.get('C','C'), vars_map)}]",
-                in_e, in_e)
-    if "residual" in ptype.lower():
-        in_e = gv("N")
-        return (f"[{in_e}]", f"[{in_e}]", in_e, in_e)
-    if "gate_forward" in ptype.lower():
-        in_e = B * T * C
-        K = gv("K")
-        out_e = B * T * K
-        return (f"[{B*T}, {_fmt_size(prim.get('C','C'), vars_map)}]",
-                f"[{B*T}, {_fmt_size(prim.get('K','K'), vars_map)}]",
-                in_e, out_e)
-    if "swiglu" in ptype.lower():
-        in_e = gv("N")
-        return (f"[{in_e}]", f"[{in_e}]", in_e, in_e)
-    # fallback 1D
-    size_expr = prim.get("size") or prim.get("OUT") or prim.get("IN") or prim.get("OC") or prim.get("C") or prim.get("N")
-    elems = _resolve_value(size_expr, vars_map) or 0
-    shape = f"[{size_expr}]"
-    return (shape, shape, elems, elems)
-
-
-def print_layer_summary(configs, vars_map, core_id=0, layer_idx=0):
-    """
-    Best-effort textual summary of one layer on one core:
-    - Per-prim input/output names
-    - Size expressions and resolved element counts if possible
-    - Send/recv across cores (shape & size expression)
-    """
-    chips = configs.get("chips", [])
-    if not chips:
-        print("[summary] no chips found")
-        return
-    cores = chips[0].get("cores", [])
-    core = next((c for c in cores if c.get("id") == core_id), None)
-    if core is None:
-        print(f"[summary] core {core_id} not found")
-        return
-
-    worklist = core.get("worklist", [])
-    cur_layer = 0
-    layer_items = []
-    for item in worklist:
-        layer_items.append(item)
-        if any(_is_layer_boundary(p) for p in item.get("prims", [])):
-            if cur_layer == layer_idx:
-                break
-            cur_layer += 1
-            layer_items = []
-    if cur_layer != layer_idx:
-        print(f"[summary] layer {layer_idx} not found on core {core_id}")
-        return
-
-    print(f"=== Layer {layer_idx} summary (core {core_id}) ===")
-    rows = []
-    dtype_bytes = vars_map.get("dtype_bytes", 2)  # assume fp16 unless provided
-    for idx, item in enumerate(layer_items):
-        prims = item.get("prims", [])
-        cast = item.get("cast", [])
-        recv_cnt = item.get("recv_cnt", 0)
-        recv_tag = item.get("recv_tag", "-")
-        recv_size = _fmt_size(_pick_size_expr(prims), vars_map)
-
-        for p_i, prim in enumerate(prims):
-            in_shape, out_shape, in_e, out_e = _infer_dims(prim, vars_map)
-            traffic_mb = (in_e + out_e) * dtype_bytes / (1024 * 1024)
-            routing = ""
-            if cast:
-                send_expr = _pick_size_expr(prims)
-                routing = f"send {_fmt_size(send_expr, vars_map)} -> {[c['dest'] for c in cast]}"
-            if recv_cnt > 0:
-                routing = f"recv tag {recv_tag} x{recv_cnt} {_fmt_size(recv_size, vars_map)}"
-            rows.append([
-                prim.get("type"),
-                in_shape,
-                out_shape,
-                f"{traffic_mb:.3f} MB" if traffic_mb > 0 else "-",
-                routing or "-"
-            ])
-    _print_table(["Kernel", "Input dim (per core)", "Output dim (per core)", "Est. traffic", "Routing"], rows)
-
-
 def init_vars(input_vars):
     dp = input_vars['dp']
     if dp > 1:
@@ -241,22 +79,26 @@ def init_vars(input_vars):
     input_vars['G'] = int(input_vars["C"] + 2 * input_vars["C"] / input_vars["R"])
     add_vars(input_vars, "BTC")
 
-    # Parse TP from tp string; in entwine mode ep == dp * tp (all cores)
+    # Parse TP from tp string
     tp_parts = input_vars['tp'].split("_")
     tp = int(tp_parts[0]) * int(tp_parts[1])
-    ep = dp * tp  # entwine: all experts distributed across all cores
-    input_vars['ep'] = ep
+
+    # MoEntwine: effective EP = dp (FTD size), NOT dp*tp
+    ep_eff = dp
+    total_cores = dp * tp
+    input_vars['ep_eff'] = ep_eff
+    input_vars['total_cores'] = total_cores
 
     # MoE-related variables
     input_vars['moeIS'] = input_vars['IS']
-    if ep > 1:
-        input_vars[f'moeIS/{ep}'] = input_vars['IS'] // ep
     input_vars['K'] = input_vars['topk']
-    # Global expert choices across the full batch B*topk, capped by total experts.
     input_vars['Kglobal'] = min(input_vars["B"] * input_vars['topk'], input_vars['experts'])
-    # Per-DP-group view (kept for is_split mode).
-    input_vars['Kdp'] = min(input_vars["Bdp"] * input_vars['topk'], input_vars['experts'])
     input_vars['E_N'] = input_vars['experts']
+
+    # Expert distribution across all cores: E_N/(dp*tp)
+    total_cores = dp * tp
+    if total_cores > 1:
+        input_vars[f'E_N/{total_cores}'] = input_vars['experts'] // total_cores
 
     # QKV dimension (3C-R means Q + K + V for GQA)
     qkv_dim = int(input_vars["C"] + 2 * input_vars["C"] / input_vars["R"])
@@ -274,17 +116,14 @@ def init_vars(input_vars):
     input_vars[f'C/2'] = input_vars['C'] // 2
     input_vars[f'NH/2'] = input_vars['NH'] // 2
     input_vars['3BTC/4'] = 3 * input_vars['B'] * input_vars['T'] * input_vars['C'] // 4
+
+    # FTD-local All-to-All data sizes
     if dp > 1:
         input_vars[f'BTC/{dp}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] // dp
+        input_vars[f'BTCK/{dp}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] * input_vars['topk'] // dp
+        input_vars[f'BTCK/{dp*dp}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] * input_vars['topk'] // (dp * dp)
     if tp > 1 and dp > 1:
         input_vars[f'BTC/{dp*tp}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] // (dp * tp)
-    if ep > 1:
-        input_vars[f'BTC/{ep}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] // ep
-        # All-to-All data size for expert_wise mode: B*T*C*K/ep (full batch)
-        input_vars[f'BTCK/{ep}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] * input_vars['topk'] // ep
-        if dp > 1:
-            # Per-core All-to-All data: each core has Bdp tokens, per-message = Bdp*T*C*K/ep
-            input_vars[f'BTCK/{dp*ep}'] = input_vars['B'] * input_vars['T'] * input_vars['C'] * input_vars['topk'] // (dp * ep)
 
 
 def add_vars(input_vars, keys):
@@ -378,7 +217,7 @@ def cal_size(word1, word2=None, word3=None, mul_num=None, div_num=None):
 
 def process_source(input_vars):
     """
-    Entwine mode: all cores receive source data.
+    MoEntwine mode: all cores receive source data.
     Core layout: dp * tp cores total.
     """
     tp = input_vars['mn'] * input_vars['k']
@@ -394,24 +233,52 @@ def process_source(input_vars):
     return source
 
 
-def process_core_worklist_entwine(input_vars, core_index, tp, core_layer, dp_index, base_id, total_cores, loop_count=1, phase="both"):
+def get_ftd_peers(core_abs_id, tp, dp):
     """
-    Generate worklist for a core in entwine mode (no EP separation).
+    Compute FTD peer core IDs for a given core.
+
+    Core abs_id c = d * tp + j, where:
+      - d = c // tp  (DP group index, i.e. which TP group)
+      - j = c % tp   (intra-TP position = FTD index)
+
+    FTD j = {d2 * tp + j for d2 in range(dp)}
+    Returns: sorted list of FTD peer core IDs (excluding self)
+    """
+    ftd_idx = core_abs_id % tp
+    peers = []
+    for d in range(dp):
+        peer = d * tp + ftd_idx
+        if peer != core_abs_id:
+            peers.append(peer)
+    return sorted(peers)
+
+
+def process_core_worklist_moentwine(input_vars, core_index, tp, core_layer, dp_index, base_id, total_cores, loop_count=1, phase="both"):
+    """
+    Generate worklist for a core in MoEntwine FTD-based mode.
     Each core handles both attention and MoE computation.
-    ep == dp * tp: all experts are evenly distributed across ALL cores.
+
+    Key difference from expert_wise: All-to-All dispatch/combine only happens
+    within each FTD (dp cores), not across all cores (dp*tp).
+
+    FTD (Full Token Domain): After TP All-Reduce, each core in a TP group holds
+    identical data. An FTD groups one core from each TP group. Each FTD
+    independently processes all experts via local All-to-All.
 
     Per layer structure:
     1. Attention: rmsnorm + QKV matmul + rope + attention + O matmul + switch_data
-    2. TP All-Reduce (sequential broadcast within dp group)
-    3. MoE computation: Residual + rmsnorm + gate_forward + moe_up x2 + swiglu + moe_down + switch_data
-    4. EP All-Reduce (sequential broadcast across ALL cores, ep == dp * tp)
-    5. Final Residual (with loop cast on last layer)
+    2. TP All-Reduce (sequential broadcast within TP group, tag 50)
+    3a. Pre-MoE: Residual + rmsnorm + gate_forward + switch_data (prepare dispatch)
+    3b. Dispatch All-to-All within FTD (tag 70, dp phases)
+    3c. MoE computation: load_expert(E_N/dp) + moe_up x2 + swiglu + moe_down + switch_data
+    3d. Combine All-to-All within FTD (tag 80, dp phases)
+    4. Final Residual
     """
     worklist = []
 
     dp = input_vars['dp']
-    ep = total_cores  # entwine: ep == dp * tp
-    core_abs_id = base_id + core_index  # absolute core id across all dp groups
+    ep_eff = dp  # effective EP = FTD size
+    core_abs_id = base_id + core_index
 
     # Pre-compute required variables
     add_vars(input_vars, "BTC")
@@ -421,22 +288,31 @@ def process_core_worklist_entwine(input_vars, core_index, tp, core_layer, dp_ind
         add_vars(input_vars, f"C/{tp}")
         add_vars(input_vars, f"3C-R/{tp}")
         add_vars(input_vars, f"NH/{tp}")
-    if ep > 1:
-        add_vars(input_vars, f"moeIS/{ep}")
-        add_vars(input_vars, f"BTC/{ep}")
+    if dp > 1:
+        add_vars(input_vars, f"BTC/{dp}")
+        add_vars(input_vars, f"BTCK/{dp*dp}")
     add_vars(input_vars, "3BTC/4")
 
     # TP size strings
-    tp_str = tp if tp > 1 else 1
     c_r_tp = f"3C-R/{tp}" if tp > 1 else "3C-R"
     nh_tp = f"NH/{tp}" if tp > 1 else "NH"
     c_tp = f"C/{tp}" if tp > 1 else "C"
     btc_dp = f"BTC/{dp}" if dp > 1 else "BTC"
     btc_tp_dp = f"BTC/{dp*tp}" if (dp > 1 and tp > 1) else (btc_dp if dp > 1 else (f"BTC/{tp}" if tp > 1 else "BTC"))
     btc_tp = f"BTC/{tp}" if tp > 1 else "BTC"
-    # EP size strings
-    moe_is_ep = f"moeIS/{ep}" if ep > 1 else "moeIS"
-    btc_ep = f"BTC/{ep}" if ep > 1 else "BTC"
+
+    # FTD-local EP size strings (key difference from expert_wise)
+    moe_is = "moeIS"  # full IS (complete experts)
+    btck_dp = f"BTCK/{dp*dp}" if dp > 1 else "BTC"  # fallback fixed size
+    # Local expert count per core: E_N/(dp*tp)
+    en_local = input_vars['experts'] // total_cores if total_cores > 1 else input_vars['experts']
+    if total_cores > 1:
+        input_vars[f'E_N/{total_cores}'] = en_local
+    en_dp_str = f"E_N/{total_cores}" if total_cores > 1 else "E_N"
+
+    # FTD peers for this core
+    ftd_peers = get_ftd_peers(core_abs_id, tp, dp) if dp > 1 else []
+    ftd_members = sorted(ftd_peers + [core_abs_id]) if dp > 1 else [core_abs_id]
 
     total_layers = core_layer * loop_count
 
@@ -445,10 +321,6 @@ def process_core_worklist_entwine(input_vars, core_index, tp, core_layer, dp_ind
         is_last_layer = (layer_idx == total_layers - 1)
 
         # Determine job_type: 0 = prefill, 1 = decode
-        # For decode phase, only the first layer (layer_idx==0) uses job_type=0
-        # to initialize the shared KV cache with T tokens. All other layers use
-        # job_type=1. Compute cost is identical since exu_ops/vec_ops don't
-        # depend on job_type; only KV cache SRAM write size differs.
         loop_iter = layer_idx // core_layer
         if phase == "prefill":
             job_type = 0
@@ -456,6 +328,31 @@ def process_core_worklist_entwine(input_vars, core_index, tp, core_layer, dp_ind
             job_type = 0 if layer_idx == 0 else 1
         else:  # both
             job_type = 0 if loop_iter == 0 else 1
+
+        # Route selection is global across all cores.
+        global_k = min(input_vars.get('Kglobal', input_vars['topk']), input_vars['experts'])
+        if total_cores > 1:
+            experts_per_core = input_vars['experts'] // total_cores
+            local_begin = core_abs_id * experts_per_core
+            local_end = local_begin + experts_per_core
+            route_seed = (MOE_ROUTE_BASE_SEED + layer_idx * 1000003) & 0x7fffffff
+            chosen_global = _sample_unique_lcg(input_vars['experts'], global_k, route_seed)
+            local_k = sum(1 for e in chosen_global if local_begin <= e < local_end)
+        else:
+            route_seed = (MOE_ROUTE_BASE_SEED + layer_idx * 1000003) & 0x7fffffff
+            local_begin = 0
+            local_k = min(global_k, input_vars['experts'])
+        local_btck = input_vars["Bdp"] * input_vars["T"] * input_vars["C"] * local_k
+
+        # Build per-sender traffic size for this FTD region in this layer.
+        ftd_sender_btck = {}
+        if dp > 1:
+            experts_per_core = input_vars['experts'] // total_cores
+            for sender_core in ftd_members:
+                s_begin = sender_core * experts_per_core
+                s_end = s_begin + experts_per_core
+                s_k = sum(1 for e in chosen_global if s_begin <= e < s_end)
+                ftd_sender_btck[sender_core] = input_vars["Bdp"] * input_vars["T"] * input_vars["C"] * s_k
 
         # =============================================
         # 1. Attention computation worklist item
@@ -558,388 +455,7 @@ def process_core_worklist_entwine(input_vars, core_index, tp, core_layer, dp_ind
         worklist.append(main_work)
 
         # =============================================
-        # 2. TP All-Reduce (sequential broadcast)
-        # =============================================
-        if tp > 1:
-            for tp_phase in range(tp):
-                if tp_phase == core_index:
-                    cast_list = [{"dest": base_id + i, "tag": 50} for i in range(tp) if i != core_index]
-                    worklist.append({
-                        "recv_cnt": 0,
-                        "cast": cast_list,
-                        "prims": [{
-                            "type": "parse_output",
-                            "size": btc_tp_dp,
-                            "sram_address": {"indata": "switch_out", "outdata": "switch_out"}
-                        }]
-                    })
-                else:
-                    worklist.append({
-                        "recv_cnt": 1,
-                        "recv_tag": 50,
-                        "cast": [],
-                        "prims": [{
-                            "type": "parse_input",
-                            "size": btc_tp_dp,
-                            "sram_address": {"indata": "switch_out", "outdata": "switch_out"}
-                        }]
-                    })
-
-        # =============================================
-        # 3. MoE dispatch + computation
-        # =============================================
-        if is_first_layer:
-            res1_indata = "rmsnorm1_in matmul2_out"
-        else:
-            res1_indata = "residual2_out matmul2_out"
-
-        moe_prims = [
-            {
-                "type": "Residual_f",
-                "N": btc_dp,
-                "sram_address": {"indata": res1_indata, "outdata": "residual1_out"},
-                "dram_address": {"data": -1, "out": "TODO"}
-            },
-            {
-                "type": "rmsnorm_forward",
-                "B": "Bdp",
-                "T": "T",
-                "C": "C",
-                "sram_address": {"indata": "_residual1_out", "outdata": "rmsnorm2_out"},
-                "dram_address": {"data": "rmsnorm2_data"}
-            },
-            {
-                "type": "gate_forward",
-                "B": "Bdp",
-                "T": "T",
-                "C": "C",
-                "K": "Kdp",
-                "E_N": "E_N",
-                "sram_address": {"indata": "_rmsnorm2_out", "outdata": "gate_out"},
-                "dram_address": {"data": -1}
-            },
-            {
-                "type": "load_expert",
-                "E_N": "E_N",
-                "K": "Kdp",
-                "C": "C",
-                "OC": moe_is_ep,
-                "need_choose": False,
-                "strategy": 2,
-                "sram_address": {
-                    "indata": "gate_out matmul_moe1_data matmul_moe2_data matmul_moe3_data",
-                    "outdata": "load_expert_out"
-                }
-            },
-            # MoE up matmul 1 (with expert selection)
-            {
-                "type": "matmul_forward_moe",
-                "B": 1,
-                "T": "T",
-                "C": "C",
-                "OC": moe_is_ep,
-                "K": "Kdp",
-                "E_N": "E_N",
-                "need_choose": True,
-                "is_merge": False,
-                # Reuse rmsnorm2_out for the next MoE matmul (avoid deletion after this prim)
-                "sram_address": {"indata": "_rmsnorm2_out", "outdata": "matmul_moe1_out"},
-                "dram_address": {"data": "matmul_moe1_data", "out": "TODO"}
-            },
-            # MoE up matmul 2 (for swiglu, reuse expert selection)
-            {
-                "type": "matmul_forward_moe",
-                "use_hw": False,
-                "B": 1,
-                "T": "T",
-                "C": "C",
-                "OC": moe_is_ep,
-                "K": "Kdp",
-                "E_N": "E_N",
-                "need_choose": False,
-                "is_merge": False,
-                "sram_address": {"indata": "rmsnorm2_out", "outdata": "matmul_moe2_out"},
-                "dram_address": {"data": "matmul_moe2_data", "out": "TODO"}
-            },
-            # swiglu
-            {
-                "type": "swiglu_forward",
-                "N": moe_is_ep,
-                "sram_address": {"indata": "matmul_moe1_out matmul_moe2_out", "outdata": "swiglu1_out"},
-                "dram_address": {"input": 0, "data": -1}
-            },
-            # MoE down matmul (merge expert results)
-            {
-                "type": "matmul_forward_moe",
-                "B": 1,
-                "T": "T",
-                "C": moe_is_ep,
-                "OC": "C",
-                "K": "Kdp",
-                "E_N": "E_N",
-                "need_choose": False,
-                "is_merge": True,
-                "sram_address": {"indata": "swiglu1_out", "outdata": "matmul_moe3_out"},
-                "dram_address": {"data": "matmul_moe3_data", "out": "TODO"}
-            },
-        ]
-
-        # switch_data for EP allreduce (only if ep > 1)
-        if ep > 1:
-            moe_prims.append({
-                "type": "switch_data",
-                "IN": btc_dp,
-                "OUT": btc_ep,
-                "sram_address": {"indata": "_matmul_moe3_out", "outdata": "ep_switch_out"}
-            })
-
-        worklist.append({
-            "recv_cnt": 0,
-            "cast": [],
-            "prims": moe_prims
-        })
-
-        # =============================================
-        # 4. EP All-Reduce (sequential broadcast across ALL cores, ep == dp * tp)
-        # =============================================
-        if ep > 1:
-            for ep_phase in range(ep):
-                if ep_phase == core_abs_id:
-                    # This core broadcasts to all other cores
-                    cast_list = [{"dest": i, "tag": 60} for i in range(ep) if i != core_abs_id]
-                    worklist.append({
-                        "recv_cnt": 0,
-                        "cast": cast_list,
-                        "prims": [{
-                            "type": "parse_output",
-                            "size": btc_ep,
-                            "sram_address": {"indata": "ep_switch_out", "outdata": "ep_switch_out"}
-                        }]
-                    })
-                else:
-                    # This core receives from broadcasting core
-                    worklist.append({
-                        "recv_cnt": 1,
-                        "recv_tag": 60,
-                        "cast": [],
-                        "prims": [{
-                            "type": "parse_input",
-                            "size": btc_ep,
-                            "sram_address": {"indata": "ep_switch_out", "outdata": "ep_switch_out"}
-                        }]
-                    })
-
-        # =============================================
-        # 5. Final Residual
-        # =============================================
-        residual_prim = {
-            "type": "Residual_f",
-            "N": btc_dp,
-            "sram_address": {"indata": "matmul_moe3_out residual1_out", "outdata": "residual2_out"},
-            "dram_address": {"data": -1, "out": "residual2_out"}
-        }
-
-        final_cast = [{"dest": -1}] if is_last_layer else []
-
-        worklist.append({
-            "recv_cnt": 0,
-            "cast": final_cast,
-            "prims": [residual_prim]
-        })
-
-    return worklist
-
-
-def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp_index, base_id, total_cores, loop_count=1, phase="both"):
-    """
-    Generate worklist for a core in expert-wise mode.
-    Each core handles both attention and MoE computation.
-    Each core holds E_N/ep COMPLETE experts (full IS), tokens are routed via All-to-All.
-
-    Per layer structure:
-    1. Attention: rmsnorm + QKV matmul + rope + attention + O matmul + switch_data
-    2. TP All-Reduce (sequential broadcast within dp group)
-    3a. Pre-MoE: Residual + rmsnorm + gate_forward + switch_data (prepare dispatch)
-    3b. Dispatch All-to-All (sequential broadcast across ALL cores, tag 70)
-    3c. MoE computation: load_expert(E_N/ep, full IS) + moe_up x2 + swiglu + moe_down + switch_data (prepare combine)
-    3d. Combine All-to-All (sequential broadcast across ALL cores, tag 80)
-    4. Final Residual (with loop cast on last layer)
-    """
-    worklist = []
-
-    dp = input_vars['dp']
-    ep = total_cores  # entwine: ep == dp * tp
-    core_abs_id = base_id + core_index  # absolute core id across all dp groups
-
-    # Pre-compute required variables
-    add_vars(input_vars, "BTC")
-    if tp > 1:
-        add_vars(input_vars, f"BTC/{tp}")
-        add_vars(input_vars, f"T/{tp}")
-        add_vars(input_vars, f"C/{tp}")
-        add_vars(input_vars, f"3C-R/{tp}")
-        add_vars(input_vars, f"NH/{tp}")
-    if ep > 1:
-        add_vars(input_vars, f"moeIS/{ep}")
-        add_vars(input_vars, f"BTC/{ep}")
-        add_vars(input_vars, f"BTCK/{ep}")
-        if dp > 1:
-            add_vars(input_vars, f"BTCK/{dp*ep}")
-            add_vars(input_vars, f"BTCK/{dp*tp}")
-    add_vars(input_vars, "3BTC/4")
-
-    # TP size strings
-    c_r_tp = f"3C-R/{tp}" if tp > 1 else "3C-R"
-    nh_tp = f"NH/{tp}" if tp > 1 else "NH"
-    c_tp = f"C/{tp}" if tp > 1 else "C"
-    btc_dp = f"BTC/{dp}" if dp > 1 else "BTC"
-    btc_tp_dp = f"BTC/{dp*tp}" if (dp > 1 and tp > 1) else (btc_dp if dp > 1 else (f"BTC/{tp}" if tp > 1 else "BTC"))
-    btc_tp = f"BTC/{tp}" if tp > 1 else "BTC"
-    # EP size strings - expert_wise: each core holds complete experts with full IS
-    moe_is_ep = "moeIS"
-    # Per-core send amount in dp-group view: B/dp * topK / tp experts worth of data.
-    btck_ep = f"BTCK/{dp*tp}" if (dp > 1 and tp > 1) else (f"BTCK/{dp}" if dp > 1 else (f"BTCK/{tp}" if tp > 1 else "BTCK"))
-    # Local expert count for load_expert
-    en_local = input_vars['experts'] // ep if ep > 1 else input_vars['experts']
-    input_vars[f'E_N/{ep}'] = en_local
-    en_ep_str = f"E_N/{ep}" if ep > 1 else "E_N"
-
-    total_layers = core_layer * loop_count
-
-    for layer_idx in range(total_layers):
-        is_first_layer = (layer_idx == 0)
-        is_last_layer = (layer_idx == total_layers - 1)
-
-        # Determine job_type: 0 = prefill, 1 = decode
-        # For decode phase, only the first layer (layer_idx==0) uses job_type=0
-        # to initialize the shared KV cache with T tokens. All other layers use
-        # job_type=1. Compute cost is identical since exu_ops/vec_ops don't
-        # depend on job_type; only KV cache SRAM write size differs.
-        loop_iter = layer_idx // core_layer
-        if phase == "prefill":
-            job_type = 0
-        elif phase == "decode":
-            job_type = 0 if layer_idx == 0 else 1
-        else:  # both
-            job_type = 0 if loop_iter == 0 else 1
-
-        # Expert-wise routing: single global routing across full batch (like FTD),
-        # seed does NOT include dp_index so all dp groups share the same routing.
-        global_k = min(input_vars.get('Kglobal', input_vars['topk']), input_vars['experts'])
-        if ep > 1:
-            experts_per_core = input_vars['experts'] // ep
-            local_begin = core_abs_id * experts_per_core
-            local_end = local_begin + experts_per_core
-            route_seed = (MOE_ROUTE_BASE_SEED + layer_idx * 1000003) & 0x7fffffff
-            chosen_global = _sample_unique_lcg(input_vars['experts'], global_k, route_seed)
-            local_k = sum(1 for e in chosen_global if local_begin <= e < local_end)
-        else:
-            route_seed = (MOE_ROUTE_BASE_SEED + layer_idx * 1000003) & 0x7fffffff
-            local_begin = 0
-            local_k = min(global_k, input_vars['experts'])
-
-        # =============================================
-        # 1. Attention computation worklist item (same as is_split)
-        # =============================================
-        if is_first_layer:
-            main_prims = [
-                {
-                    "type": "parse_input",
-                    "size": btc_dp,
-                    "sram_address": {"indata": "_residual2_out", "outdata": "rmsnorm1_in"}
-                },
-                {
-                    "type": "rmsnorm_forward",
-                    "B": "Bdp",
-                    "T": "T",
-                    "C": "C",
-                    "sram_address": {"indata": "_rmsnorm1_in", "outdata": "rmsnorm1_out"},
-                    "dram_address": {"data": "rmsnorm1_data"}
-                },
-            ]
-            main_recv_cnt = 1
-        else:
-            main_prims = [
-                {
-                    "type": "rmsnorm_forward",
-                    "B": "Bdp",
-                    "T": "T",
-                    "C": "C",
-                    "sram_address": {"indata": "_residual2_out", "outdata": "rmsnorm1_out"},
-                    "dram_address": {"data": "rmsnorm1_data"}
-                },
-            ]
-            main_recv_cnt = 0
-
-        main_prims += [
-            {
-                "type": "matmul_forward_pd",
-                "use_hw": False,
-                "B": "Bdp",
-                "T": "T",
-                "C": "C",
-                "OC": c_r_tp,
-                "R": "R",
-                "chunk": "chunk",
-                "job_type": job_type,
-                "sram_address": {"indata": "rmsnorm1_out", "outdata": "matmul1_out"},
-                "dram_address": {"data": "matmul1_data"}
-            },
-            {
-                "type": "rope_forward_pd",
-                "B": "Bdp",
-                "T": "T",
-                "C": c_r_tp,
-                "NH": nh_tp,
-                "R": "R",
-                "job_type": job_type,
-                "sram_address": {"indata": "matmul1_out", "outdata": "rope1_out"},
-                "dram_address": {"data": "rope1_data"}
-            },
-            {
-                "type": "Attention_f_pd",
-                "B": "Bdp",
-                "T": "T",
-                "C": c_tp,
-                "NH": nh_tp,
-                "DH": "DH",
-                "R": "R",
-                "job_type": job_type,
-                "sram_address": {"indata": "rope1_out", "outdata": "attention1_out"},
-                "dram_address": {"data": "attention1_data", "out": "TODO"}
-            },
-            {
-                "type": "Matmul_f",
-                "use_hw": False,
-                "B": "Bdp",
-                "T": "T",
-                "C": c_tp,
-                "OC": "C",
-                "sram_address": {"indata": "attention1_out", "outdata": "matmul2_out"},
-                "dram_address": {"data": "matmul2_data"}
-            },
-        ]
-
-        # switch_data for TP allreduce (only if tp > 1)
-        if tp > 1:
-            main_prims.append({
-                "type": "switch_data",
-                "IN": btc_dp,
-                "OUT": btc_tp_dp,
-                "sram_address": {"indata": "_matmul2_out", "outdata": "switch_out"}
-            })
-
-        main_work = {
-            "recv_cnt": main_recv_cnt,
-            "cast": [],
-            "prims": main_prims
-        }
-        if is_first_layer:
-            main_work["recv_tag"] = base_id + core_index
-        worklist.append(main_work)
-
-        # =============================================
-        # 2. TP All-Reduce (sequential broadcast, same as is_split)
+        # 2. TP All-Reduce (sequential broadcast within TP group)
         # =============================================
         if tp > 1:
             for tp_phase in range(tp):
@@ -1001,12 +517,12 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
             },
         ]
 
-        # switch_data to prepare dispatch data (only if ep > 1)
-        if ep > 1:
+        # switch_data to prepare dispatch data (only if dp > 1, FTD-local)
+        if dp > 1:
             pre_moe_prims.append({
                 "type": "switch_data",
                 "IN": btc_dp,
-                "OUT": btck_ep,
+                "OUT": local_btck,
                 "sram_address": {"indata": "_rmsnorm2_out", "outdata": "dispatch_switch_out"}
             })
 
@@ -1017,51 +533,51 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
         })
 
         # =============================================
-        # 3b. Dispatch All-to-All (sequential broadcast, per-msg = BTCK/ep²)
-        # Phase ordering: Core ep-1 sends first (reversed), so the slowest core
-        # (last to exit Combine) acts as an implicit barrier before Dispatch begins.
-        # This prevents timing desync where fast cores (low IDs) start Dispatch
-        # while slow cores (high IDs) are still in TP All-Reduce.
+        # 3b. Dispatch All-to-All WITHIN FTD (tag 70, dp phases)
         # =============================================
-        if ep > 1:
-            for ep_phase in range(ep):
-                if ep_phase == (ep - 1 - core_abs_id):
-                    cast_list = [{"dest": i, "tag": 70} for i in range(ep) if i != core_abs_id]
+        if dp > 1:
+            for ftd_phase_core in ftd_members:
+                phase_size = ftd_sender_btck.get(ftd_phase_core, 0)
+                if ftd_phase_core == core_abs_id:
+                    # This core sends dispatch data to FTD peers only
+                    cast_list = [{"dest": peer, "tag": 70} for peer in ftd_peers]
                     worklist.append({
                         "recv_cnt": 0,
                         "cast": cast_list,
                         "prims": [{
                             "type": "parse_output",
-                            "size": btck_ep,
+                            "size": phase_size,
                             "sram_address": {"indata": "dispatch_switch_out", "outdata": "dispatch_switch_out"}
                         }]
                     })
                 else:
+                    # This core receives dispatch data from FTD peer
                     worklist.append({
                         "recv_cnt": 1,
                         "recv_tag": 70,
                         "cast": [],
                         "prims": [{
                             "type": "parse_input",
-                            "size": btck_ep,
+                            "size": phase_size,
                             "sram_address": {"indata": "dispatch_switch_out", "outdata": "dispatch_switch_out"}
                         }]
                     })
 
         # =============================================
-        # 3c. MoE computation (local experts with full IS)
+        # 3c. MoE computation (E_N/dp local experts with full IS)
         # =============================================
+        load_expert_indata = "gate_out dispatch_switch_out matmul_moe1_data matmul_moe2_data matmul_moe3_data" if dp > 1 else "gate_out matmul_moe1_data matmul_moe2_data matmul_moe3_data"
         moe_compute_prims = [
             {
                 "type": "load_expert",
-                "E_N": en_ep_str,
+                "E_N": en_dp_str,
                 "K": local_k,
                 "C": "C",
-                "OC": "moeIS",
+                "OC": moe_is,
                 "need_choose": False,
                 "strategy": 2,
                 "sram_address": {
-                    "indata": "gate_out dispatch_switch_out matmul_moe1_data matmul_moe2_data matmul_moe3_data",
+                    "indata": load_expert_indata,
                     "outdata": "load_expert_out"
                 }
             },
@@ -1071,12 +587,11 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
                 "B": 1,
                 "T": "T",
                 "C": "C",
-                "OC": moe_is_ep,
+                "OC": moe_is,
                 "K": local_k,
-                "E_N": en_ep_str,
+                "E_N": en_dp_str,
                 "need_choose": True,
                 "is_merge": False,
-                # Route metadata lets simulator reconstruct the exact same local expert IDs.
                 "route_mode": 1,
                 "route_seed": route_seed,
                 "route_global_en": input_vars['experts'],
@@ -1092,9 +607,9 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
                 "B": 1,
                 "T": "T",
                 "C": "C",
-                "OC": moe_is_ep,
+                "OC": moe_is,
                 "K": local_k,
-                "E_N": en_ep_str,
+                "E_N": en_dp_str,
                 "need_choose": False,
                 "is_merge": False,
                 "sram_address": {"indata": "rmsnorm2_out", "outdata": "matmul_moe2_out"},
@@ -1103,7 +618,7 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
             # swiglu
             {
                 "type": "swiglu_forward",
-                "N": moe_is_ep,
+                "N": moe_is,
                 "sram_address": {"indata": "matmul_moe1_out matmul_moe2_out", "outdata": "swiglu1_out"},
                 "dram_address": {"input": 0, "data": -1}
             },
@@ -1112,10 +627,10 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
                 "type": "matmul_forward_moe",
                 "B": 1,
                 "T": "T",
-                "C": moe_is_ep,
+                "C": moe_is,
                 "OC": "C",
                 "K": local_k,
-                "E_N": en_ep_str,
+                "E_N": en_dp_str,
                 "need_choose": False,
                 "is_merge": True,
                 "sram_address": {"indata": "swiglu1_out", "outdata": "matmul_moe3_out"},
@@ -1123,12 +638,12 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
             },
         ]
 
-        # switch_data to prepare combine data (only if ep > 1)
-        if ep > 1:
+        # switch_data to prepare combine data (only if dp > 1)
+        if dp > 1:
             moe_compute_prims.append({
                 "type": "switch_data",
                 "IN": btc_dp,
-                "OUT": btck_ep,
+                "OUT": local_btck,
                 "sram_address": {"indata": "_matmul_moe3_out", "outdata": "combine_switch_out"}
             })
 
@@ -1139,30 +654,32 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
         })
 
         # =============================================
-        # 3d. Combine All-to-All (sequential broadcast, per-msg = BTCK/ep²)
-        # Same reversed phase ordering as Dispatch for consistency.
+        # 3d. Combine All-to-All WITHIN FTD (tag 80, dp phases)
         # =============================================
-        if ep > 1:
-            for ep_phase in range(ep):
-                if ep_phase == (ep - 1 - core_abs_id):
-                    cast_list = [{"dest": i, "tag": 80} for i in range(ep) if i != core_abs_id]
+        if dp > 1:
+            for ftd_phase_core in ftd_members:
+                phase_size = ftd_sender_btck.get(ftd_phase_core, 0)
+                if ftd_phase_core == core_abs_id:
+                    # This core sends combine data to FTD peers only
+                    cast_list = [{"dest": peer, "tag": 80} for peer in ftd_peers]
                     worklist.append({
                         "recv_cnt": 0,
                         "cast": cast_list,
                         "prims": [{
                             "type": "parse_output",
-                            "size": btck_ep,
+                            "size": phase_size,
                             "sram_address": {"indata": "combine_switch_out", "outdata": "combine_switch_out"}
                         }]
                     })
                 else:
+                    # This core receives combine data from FTD peer
                     worklist.append({
                         "recv_cnt": 1,
                         "recv_tag": 80,
                         "cast": [],
                         "prims": [{
                             "type": "parse_input",
-                            "size": btck_ep,
+                            "size": phase_size,
                             "sram_address": {"indata": "combine_switch_out", "outdata": "combine_switch_out"}
                         }]
                     })
@@ -1170,7 +687,7 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
         # =============================================
         # 4. Final Residual
         # =============================================
-        moe_result = "combine_switch_out" if ep > 1 else "matmul_moe3_out"
+        moe_result = "combine_switch_out" if dp > 1 else "matmul_moe3_out"
         residual_prim = {
             "type": "Residual_f",
             "N": btc_dp,
@@ -1191,9 +708,9 @@ def process_core_worklist_expert_wise(input_vars, core_index, tp, core_layer, dp
 
 def process_cores(input_vars):
     """
-    Entwine mode: all cores are identical, handling both attention and MoE.
-    Core layout: dp groups, each with tp cores. ep == dp * tp.
-    Total cores = dp * tp.
+    MoEntwine mode: all cores handle both attention and MoE.
+    Core layout: dp groups, each with tp cores. Total = dp * tp.
+    FTDs: tp FTDs, each with dp cores (one from each TP group).
     """
     tp = input_vars['mn'] * input_vars['k']
     dp = input_vars['dp']
@@ -1201,9 +718,6 @@ def process_cores(input_vars):
     total_cores = dp * tp
     loop_count = input_vars.get('loop', 1)
     phase = input_vars.get('phase', 'both')
-    ep_mode = input_vars.get('ep_mode', 'is_split')
-
-    worklist_fn = process_core_worklist_expert_wise if ep_mode == "expert_wise" else process_core_worklist_entwine
 
     cores = []
     for d in range(dp):
@@ -1211,7 +725,7 @@ def process_cores(input_vars):
         for i in range(tp):
             core = {
                 "id": base + i,
-                "worklist": worklist_fn(
+                "worklist": process_core_worklist_moentwine(
                     input_vars, i, tp, core_layer, d, base, total_cores, loop_count, phase)
             }
             cores.append(core)
@@ -1277,8 +791,9 @@ def list_presets():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MoE workload generator - entwine mode (no EP separation)")
-    parser.add_argument("--file_name", type=str, help="name of output traces", default="./moe_entwine.json", required=False)
+    parser = argparse.ArgumentParser(
+        description="MoE workload generator - MoEntwine FTD-based mode (FTD-local All-to-All)")
+    parser.add_argument("--file_name", type=str, help="name of output traces", default="./moe_moentwine.json", required=False)
     parser.add_argument("--preset", type=str, help="preset MoE model name (use --list_presets to see all)", default=None, required=False)
     parser.add_argument("--list_presets", action="store_true", help="list all available preset models and exit")
     parser.add_argument("--B", type=int, help="Batch_size", default=1, required=False)
@@ -1288,7 +803,7 @@ def main():
     parser.add_argument("--KVH", type=int, help="KV heads", default=8, required=False)
     parser.add_argument("--HS", type=int, help="hidden size", default=2560, required=False)
     parser.add_argument("--L", type=int, help="transformer layers", default=1, required=False)
-    parser.add_argument("--dp", type=int, help="dataset parallel", default=1, required=False)
+    parser.add_argument("--dp", type=int, help="dataset parallel (= FTD size = effective EP)", default=1, required=False)
     parser.add_argument("--tp", type=str, help="tensor parallel, mn_k", default="1_1", required=False)
     parser.add_argument("--IS", type=int, help="intermediate size (expert hidden size for moe)", default=14336, required=False)
     parser.add_argument("--avg_output", type=int, help="average output tokens", default=10, required=False)
@@ -1297,12 +812,6 @@ def main():
     parser.add_argument("--topk", type=int, help="top k experts", default=2, required=False)
     parser.add_argument("--phase", type=str, choices=["prefill", "decode", "both"],
                         help="workload phase: prefill (job_type=0), decode (job_type=1), or both", default="both", required=False)
-    #   --phase prefill: 只生成 prefill 阶段，job_type=0，loop=1
-    #   --phase decode: 只生成 decode 阶段，job_type=1，loop=avg_output
-    #   --phase both (默认): prefill + decode，第一个 loop 迭代 job_type=0，之后 job_type=1，loop=avg_output+1
-    parser.add_argument("--ep_mode", type=str, choices=["is_split", "expert_wise"],
-                        help="EP parallelism mode: is_split (split IS across all cores) or expert_wise (each core holds E_N/ep complete experts)",
-                        default="expert_wise", required=False)
 
     args = parser.parse_args()
 
@@ -1311,6 +820,7 @@ def main():
         return
 
     input_vars = vars(args)
+
     # Apply preset if specified
     if args.preset:
         preset_name = args.preset.lower()
@@ -1349,12 +859,18 @@ def main():
     input_vars = input_vars | varitations
     init_vars(input_vars)
 
-    # Validate expert_wise mode constraints
-    if input_vars.get('ep_mode') == 'expert_wise':
-        ep = input_vars.get('ep', 1)
-        if ep > 1 and input_vars['experts'] % ep != 0:
-            print(f"Error: experts ({input_vars['experts']}) must be divisible by ep ({ep}) in expert_wise mode")
-            return
+    # Validate MoEntwine constraints
+    dp = input_vars['dp']
+    tp_parts = input_vars['tp'].split("_")
+    tp = int(tp_parts[0]) * int(tp_parts[1])
+    total_cores = dp * tp
+    if total_cores > 1 and input_vars['experts'] % total_cores != 0:
+        print(f"Error: experts ({input_vars['experts']}) must be divisible by total cores ({total_cores}) in MoEntwine mode")
+        return
+    if dp <= 1:
+        print("Warning: dp=1 means no FTD parallelism. MoE computation is local only.")
+    if tp <= 1:
+        print("Warning: tp=1 means each FTD contains all cores. Equivalent to expert_wise mode.")
 
     # Adjust loop count based on phase
     if input_vars['phase'] == "prefill":
@@ -1377,21 +893,13 @@ def main():
     input_vars.pop('tp')
     input_vars.pop('model')
     input_vars.pop('file_name', None)
-    if 'ep' in input_vars and input_vars['ep'] <= 1:
-        input_vars.pop('ep')
-    input_vars.pop('loop', None)  # Remove loop from output vars (unrolled into worklist)
-    input_vars.pop('phase', None)  # Remove phase from output vars
-    input_vars.pop('ep_mode', None)  # Remove ep_mode from output vars
+    input_vars.pop('loop', None)
+    input_vars.pop('phase', None)
+    input_vars.pop('ep_eff', None)
+    input_vars.pop('total_cores', None)
 
     with open(args.file_name, "w", encoding="utf-8") as f:
         f.write(_compact_json(configs))
-
-    # --- summary for core0 layer0 -------------------------------------------------
-    summary_vars = dict(input_vars)
-    try:
-        print_layer_summary(configs, summary_vars, core_id=0, layer_idx=0)
-    except Exception as exc:  # best-effort; keep main output intact
-        print(f"[summary skipped] {exc}")
 
 
 if __name__ == '__main__':
