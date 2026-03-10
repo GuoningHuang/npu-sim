@@ -253,6 +253,46 @@ def get_ftd_peers(core_abs_id, tp, dp):
     return sorted(peers)
 
 
+def _split_size_across_peers(total_size, peers, weights=None):
+    """
+    Split a sender's total traffic size across peers (integer exact sum).
+    If weights are provided, split proportionally to weights[peer].
+    Keep integer sizes and preserve total sum exactly.
+    """
+    n = len(peers)
+    if n == 0:
+        return {}
+    if weights is None:
+        weights = {p: 1 for p in peers}
+
+    w_sum = sum(max(0, int(weights.get(p, 0))) for p in peers)
+    if w_sum <= 0:
+        base = total_size // n
+        rem = total_size % n
+        out = {}
+        for i, p in enumerate(peers):
+            out[p] = base + (1 if i < rem else 0)
+        return out
+
+    out = {}
+    assigned = 0
+    fracs = []
+    for p in peers:
+        w = max(0, int(weights.get(p, 0)))
+        raw_num = total_size * w
+        q = raw_num // w_sum
+        r = raw_num % w_sum
+        out[p] = q
+        assigned += q
+        fracs.append((r, p))
+
+    rem = total_size - assigned
+    fracs.sort(key=lambda x: x[0], reverse=True)
+    for i in range(rem):
+        out[fracs[i % len(fracs)][1]] += 1
+    return out
+
+
 def process_core_worklist_moentwine(input_vars, core_index, tp, core_layer, dp_index, base_id, total_cores, loop_count=1, phase="both"):
     """
     Generate worklist for a core in MoEntwine FTD-based mode.
@@ -344,15 +384,42 @@ def process_core_worklist_moentwine(input_vars, core_index, tp, core_layer, dp_i
             local_k = min(global_k, input_vars['experts'])
         local_btck = input_vars["Bdp"] * input_vars["T"] * input_vars["C"] * local_k
 
-        # Build per-sender traffic size for this FTD region in this layer.
+        # Build per-core traffic size for this FTD region in this layer.
+        # FTD communication model:
+        # 1) Compute FTD total traffic from sum(local_k) within this FTD.
+        # 2) Split that total evenly as sender budgets across FTD members.
+        # 3) For each sender, split sender budget to peers by destination local_k.
+        #    This is NOT full broadcast. Sender total is divided across peers.
+        #    If peer local_k are equal, peer shares become (near) equal.
         ftd_sender_btck = {}
+        ftd_core_k = {}
         if dp > 1:
             experts_per_core = input_vars['experts'] // total_cores
             for sender_core in ftd_members:
                 s_begin = sender_core * experts_per_core
                 s_end = s_begin + experts_per_core
                 s_k = sum(1 for e in chosen_global if s_begin <= e < s_end)
-                ftd_sender_btck[sender_core] = input_vars["Bdp"] * input_vars["T"] * input_vars["C"] * s_k
+                ftd_core_k[sender_core] = s_k
+            # User-requested model:
+            # 1) FTD total traffic is based on sum(local_k) within this FTD.
+            # 2) Sender totals are evenly split across all cores in this FTD.
+            unit_btck = input_vars["Bdp"] * input_vars["T"] * input_vars["C"]
+            ftd_total_btck = unit_btck * sum(ftd_core_k.values())
+            ftd_sender_btck = _split_size_across_peers(ftd_total_btck, ftd_members)
+        ftd_sender_to_peer_btck = {}
+        if dp > 1:
+            for sender_core in ftd_members:
+                sender_peers = [p for p in ftd_members if p != sender_core]
+                # Split each sender's traffic by destination local_k so receive
+                # amount tracks destination expert activity.
+                peer_weights = {p: ftd_core_k.get(p, 0) for p in sender_peers}
+                split_map = _split_size_across_peers(
+                    ftd_sender_btck.get(sender_core, 0),
+                    sender_peers,
+                    peer_weights
+                )
+                for peer_core, peer_size in split_map.items():
+                    ftd_sender_to_peer_btck[(sender_core, peer_core)] = peer_size
 
         # =============================================
         # 1. Attention computation worklist item
@@ -537,28 +604,29 @@ def process_core_worklist_moentwine(input_vars, core_index, tp, core_layer, dp_i
         # =============================================
         if dp > 1:
             for ftd_phase_core in ftd_members:
-                phase_size = ftd_sender_btck.get(ftd_phase_core, 0)
                 if ftd_phase_core == core_abs_id:
-                    # This core sends dispatch data to FTD peers only
-                    cast_list = [{"dest": peer, "tag": 70} for peer in ftd_peers]
-                    worklist.append({
-                        "recv_cnt": 0,
-                        "cast": cast_list,
-                        "prims": [{
-                            "type": "parse_output",
-                            "size": phase_size,
-                            "sram_address": {"indata": "dispatch_switch_out", "outdata": "dispatch_switch_out"}
-                        }]
-                    })
+                    # This core sends dispatch data to each FTD peer (split by peer).
+                    for peer in ftd_peers:
+                        peer_size = ftd_sender_to_peer_btck.get((core_abs_id, peer), 0)
+                        worklist.append({
+                            "recv_cnt": 0,
+                            "cast": [{"dest": peer, "tag": 70}],
+                            "prims": [{
+                                "type": "parse_output",
+                                "size": peer_size,
+                                "sram_address": {"indata": "dispatch_switch_out", "outdata": "dispatch_switch_out"}
+                            }]
+                        })
                 else:
                     # This core receives dispatch data from FTD peer
+                    peer_size = ftd_sender_to_peer_btck.get((ftd_phase_core, core_abs_id), 0)
                     worklist.append({
                         "recv_cnt": 1,
                         "recv_tag": 70,
                         "cast": [],
                         "prims": [{
                             "type": "parse_input",
-                            "size": phase_size,
+                            "size": peer_size,
                             "sram_address": {"indata": "dispatch_switch_out", "outdata": "dispatch_switch_out"}
                         }]
                     })
@@ -658,28 +726,29 @@ def process_core_worklist_moentwine(input_vars, core_index, tp, core_layer, dp_i
         # =============================================
         if dp > 1:
             for ftd_phase_core in ftd_members:
-                phase_size = ftd_sender_btck.get(ftd_phase_core, 0)
                 if ftd_phase_core == core_abs_id:
-                    # This core sends combine data to FTD peers only
-                    cast_list = [{"dest": peer, "tag": 80} for peer in ftd_peers]
-                    worklist.append({
-                        "recv_cnt": 0,
-                        "cast": cast_list,
-                        "prims": [{
-                            "type": "parse_output",
-                            "size": phase_size,
-                            "sram_address": {"indata": "combine_switch_out", "outdata": "combine_switch_out"}
-                        }]
-                    })
+                    # This core sends combine data to each FTD peer (split by peer).
+                    for peer in ftd_peers:
+                        peer_size = ftd_sender_to_peer_btck.get((core_abs_id, peer), 0)
+                        worklist.append({
+                            "recv_cnt": 0,
+                            "cast": [{"dest": peer, "tag": 80}],
+                            "prims": [{
+                                "type": "parse_output",
+                                "size": peer_size,
+                                "sram_address": {"indata": "combine_switch_out", "outdata": "combine_switch_out"}
+                            }]
+                        })
                 else:
                     # This core receives combine data from FTD peer
+                    peer_size = ftd_sender_to_peer_btck.get((ftd_phase_core, core_abs_id), 0)
                     worklist.append({
                         "recv_cnt": 1,
                         "recv_tag": 80,
                         "cast": [],
                         "prims": [{
                             "type": "parse_input",
-                            "size": phase_size,
+                            "size": peer_size,
                             "sram_address": {"indata": "combine_switch_out", "outdata": "combine_switch_out"}
                         }]
                     })
