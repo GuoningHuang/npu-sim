@@ -26,6 +26,66 @@ def _sample_unique_lcg(total, count, seed):
     return chosen
 
 
+def _split_size_across_peers(total_size, peers, weights=None):
+    """
+    Split integer traffic size across peers and preserve the total sum.
+    If weights are provided, split proportionally to weights[peer].
+    """
+    n = len(peers)
+    if n == 0:
+        return {}
+    if weights is None:
+        weights = {p: 1 for p in peers}
+
+    w_sum = sum(max(0, int(weights.get(p, 0))) for p in peers)
+    if w_sum <= 0:
+        base = total_size // n
+        rem = total_size % n
+        out = {}
+        for i, p in enumerate(peers):
+            out[p] = base + (1 if i < rem else 0)
+        return out
+
+    out = {}
+    assigned = 0
+    fracs = []
+    for p in peers:
+        w = max(0, int(weights.get(p, 0)))
+        raw_num = total_size * w
+        q = raw_num // w_sum
+        r = raw_num % w_sum
+        out[p] = q
+        assigned += q
+        fracs.append((r, p))
+
+    rem = total_size - assigned
+    fracs.sort(key=lambda x: x[0], reverse=True)
+    for i in range(rem):
+        out[fracs[i % len(fracs)][1]] += 1
+    return out
+
+
+def _moe_core_local_k_map(input_vars, layer_idx, moe_ep, moe_tp, moe_base_id):
+    """
+    Build local_k per MoE core id for a given layer.
+    All TP shards within the same EP group share the same local_k.
+    """
+    experts = input_vars['experts']
+    global_k = min(input_vars.get('Kglobal', input_vars['topk']), experts)
+    route_seed = (MOE_ROUTE_BASE_SEED + layer_idx * 1000003) & 0x7fffffff
+    chosen_global = _sample_unique_lcg(experts, global_k, route_seed)
+
+    experts_per_ep = experts // moe_ep if moe_ep > 1 else experts
+    local_k_map = {}
+    for moe_idx in range(moe_ep * moe_tp):
+        ep_idx = moe_idx // moe_tp
+        local_begin = ep_idx * experts_per_ep
+        local_end = local_begin + experts_per_ep
+        local_k = sum(1 for e in chosen_global if local_begin <= e < local_end)
+        local_k_map[moe_base_id + moe_idx] = local_k
+    return local_k_map
+
+
 def _compact_json(obj, indent=4, level=0, compact=False):
     """Serialize JSON with prim dicts (containing 'type') on a single line."""
     if compact:
@@ -1175,7 +1235,7 @@ def generate_ring_allreduce_worklist_ep(ep, core_index, size, base_core_id):
     return worklist
 
 
-def process_attention_core_worklist_ep(input_vars, core_index, tp, moe_ep, moe_tp, core_layer, dp_index, base_id, moe_base_id, loop_count=1):
+def process_attention_core_worklist_ep(input_vars, core_index, tp, moe_ep, moe_tp, core_layer, dp_index, base_id, moe_base_id, attn_cores, loop_count=1):
     """
     Generate worklist for Attention Core in EP mode without pp.
 
@@ -1316,12 +1376,19 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, moe_ep, moe_t
                         }]
                     })
 
-        # --- Dispatch: Residual + rmsnorm + gate_forward + cast to MoE cores ---
-        dispatch_cast = []
-        for ep_idx in range(moe_ep):
-            for tp_idx in range(moe_tp):
-                moe_idx = ep_idx * moe_tp + tp_idx
-                dispatch_cast.append({"dest": moe_base_id + moe_idx, "weight": tp, "tag": 80})
+        # --- Dispatch: Residual + rmsnorm + gate_forward + weighted cast to MoE cores ---
+        moe_dests = [moe_base_id + i for i in range(moe_ep * moe_tp)]
+        local_k_map = _moe_core_local_k_map(input_vars, layer_idx, moe_ep, moe_tp, moe_base_id)
+        # Per-user model: each attention core sends (B*topk/attn_cores) expert units.
+        # Convert expert units to traffic size with Bdp*T*C.
+        per_attn_btck = (
+            input_vars["Bdp"] * input_vars["T"] * input_vars["C"] * input_vars["B"] * input_vars["topk"]
+        ) // attn_cores
+        dispatch_size_map = _split_size_across_peers(
+            per_attn_btck,
+            moe_dests,
+            {dest: local_k_map.get(dest, 0) for dest in moe_dests}
+        )
 
         if is_first_layer:
             res1_indata = "rmsnorm1_in matmul2_out"
@@ -1353,18 +1420,24 @@ def process_attention_core_worklist_ep(input_vars, core_index, tp, moe_ep, moe_t
                 "sram_address": {"indata": "_rmsnorm2_out", "outdata": "gate_out"},
                 "dram_address": {"data": -1}
             },
-            {
-                "type": "parse_output",
-                "size": "BTC",
-                "sram_address": {"indata": "rmsnorm2_out", "outdata": "rmsnorm2_out"}
-            }
         ]
 
         worklist.append({
             "recv_cnt": 0,
-            "cast": dispatch_cast,
+            "cast": [],
             "prims": dispatch_prims
         })
+
+        for dest in moe_dests:
+            worklist.append({
+                "recv_cnt": 0,
+                "cast": [{"dest": dest, "weight": tp, "tag": 80}],
+                "prims": [{
+                    "type": "parse_output",
+                    "size": dispatch_size_map.get(dest, 0),
+                    "sram_address": {"indata": "rmsnorm2_out", "outdata": "rmsnorm2_out"}
+                }]
+            })
 
         # --- Padding to align with MoE return ---
         pad_steps = moe_ep * moe_tp if (moe_ep * moe_tp) > 1 else 0
@@ -1434,6 +1507,17 @@ def process_moe_core_worklist_ep(input_vars, moe_core_index, tp, moe_ep, moe_tp,
         chosen_global = _sample_unique_lcg(input_vars['experts'], global_k, route_seed)
         local_end = local_begin + experts_per_ep
         local_k = sum(1 for e in chosen_global if local_begin <= e < local_end)
+        moe_core_abs_id = moe_base_id + moe_core_index
+        moe_dests = [moe_base_id + i for i in range(moe_ep * moe_tp)]
+        local_k_map = _moe_core_local_k_map(input_vars, layer_idx, moe_ep, moe_tp, moe_base_id)
+        per_attn_btck = (
+            input_vars["Bdp"] * input_vars["T"] * input_vars["C"] * input_vars["B"] * input_vars["topk"]
+        ) // attn_cores
+        recv_size_from_attn = _split_size_across_peers(
+            per_attn_btck,
+            moe_dests,
+            {dest: local_k_map.get(dest, 0) for dest in moe_dests}
+        ).get(moe_core_abs_id, 0)
 
         # --- Padding to align with Attention dispatch ---
         pad_steps = 1 + (tp if tp > 1 else 0)
@@ -1448,7 +1532,7 @@ def process_moe_core_worklist_ep(input_vars, moe_core_index, tp, moe_ep, moe_tp,
         moe_prims = [
             {
                 "type": "parse_input",
-                "size": btc_dp,
+                "size": recv_size_from_attn,
                 "sram_address": {"indata": "input_label", "outdata": "input_label"}
             },
             {
@@ -1544,14 +1628,16 @@ def process_moe_core_worklist_ep(input_vars, moe_core_index, tp, moe_ep, moe_tp,
                         }]
                     })
 
-        # --- Cast result back to ALL Attention cores ---
+        # --- Combine: cast result back to ALL Attention cores ---
+        # Keep combine symmetric with dispatch: per-destination message size
+        # equals the per-attention dispatch contribution to this MoE core.
         cast_list = [{"dest": i, "tag": 81} for i in range(attn_cores)]
         worklist.append({
             "recv_cnt": 0,
             "cast": cast_list,
             "prims": [{
                 "type": "parse_output",
-                "size": btc_dp,
+                "size": recv_size_from_attn,
                 "sram_address": {"indata": "matmul_moe3_out", "outdata": "matmul_moe3_out"}
             }]
         })
@@ -1594,7 +1680,7 @@ def process_cores_ep_mode(input_vars):
                 "id": attn_base + i,
                 "worklist": process_attention_core_worklist_ep(
                     input_vars, i, tp, moe_ep, moe_tp, core_layer,
-                    d, attn_base, moe_base, loop_count)
+                    d, attn_base, moe_base, attn_cores, loop_count)
             }
             cores.append(core)
 
