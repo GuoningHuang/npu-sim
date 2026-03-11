@@ -1877,6 +1877,7 @@ def list_presets():
 
 
 def main():
+    global MOE_ROUTE_BASE_SEED
     parser = argparse.ArgumentParser()
     parser.add_argument("--file_name", type=str, help="name of output traces", default="./moe.json", required=False)
     parser.add_argument("--preset", type=str, help="preset MoE model name (use --list_presets to see all)", default=None, required=False)
@@ -1897,8 +1898,10 @@ def main():
     parser.add_argument("--topk", type=int, help="top k experts", default=2, required=False)
     parser.add_argument("--moe_ep", type=int, help="moe expert parallel degree", default=1, required=False)
     parser.add_argument("--moe_tp", type=int, help="moe tensor parallel degree", default=1, required=False)
+    parser.add_argument("--route_seed", type=int, help="base random seed for MoE routing/all2all expert selection", default=MOE_ROUTE_BASE_SEED, required=False)
 
     args = parser.parse_args()
+    MOE_ROUTE_BASE_SEED = args.route_seed & 0x7fffffff
 
     if args.list_presets:
         list_presets()
@@ -1964,6 +1967,7 @@ def main():
     input_vars.pop('tp')
     input_vars.pop('model')
     input_vars.pop('file_name', None)  # Remove string field that breaks C++ parser
+    input_vars.pop('route_seed', None)
     if 'moe_ep' in input_vars and input_vars['moe_ep'] <= 1:
         input_vars.pop('moe_ep')
     if 'moe_tp' in input_vars and input_vars['moe_tp'] <= 1:
